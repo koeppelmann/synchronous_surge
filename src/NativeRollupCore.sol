@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Call, IProofVerifier} from "./interfaces/IProofVerifier.sol";
+import {OutgoingCall, IProofVerifier} from "./interfaces/IProofVerifier.sol";
 import {L2SenderProxy} from "./L2SenderProxy.sol";
 
 /// @title NativeRollupCore
@@ -13,6 +13,15 @@ import {L2SenderProxy} from "./L2SenderProxy.sol";
 /// - Computed deterministically from previous L2 state + input calldata
 /// - Proven and verified atomically with submission
 /// - Able to trigger L1 calls with proper msg.sender via L2SenderProxy
+///
+/// SYNCHRONOUS COMPOSABILITY:
+/// L1 calls can affect L2 state (e.g., deposits, callbacks). To handle this:
+/// - State is committed BEFORE each L1 call executes
+/// - Each outgoing call specifies its expected post-call L2 state hash
+/// - This allows L1 contracts to read consistent L2 state during execution
+///
+/// STATE TRANSITION CHAIN:
+/// prevBlockHash → postExecutionStateHash → call[0].postCallStateHash → call[1].postCallStateHash → ...
 ///
 /// OUTGOING CALLS:
 /// Each outgoing call specifies a `from` address (the L2 contract initiating the call).
@@ -45,6 +54,13 @@ contract NativeRollupCore {
         bytes32 indexed prevBlockHash,
         bytes32 indexed newBlockHash,
         uint256 outgoingCallsCount
+    );
+
+    /// @notice Emitted when L2 state is updated (includes intermediate states)
+    event L2StateUpdated(
+        uint256 indexed blockNumber,
+        bytes32 indexed newStateHash,
+        uint256 callIndex  // 0 = post-execution, 1+ = after outgoing call
     );
 
     /// @notice Emitted when an outgoing L1 call is executed
@@ -93,18 +109,18 @@ contract NativeRollupCore {
     }
 
     /// @notice Process a call on L2 and execute resulting L1 calls
-    /// @dev Flattened execution - builder pre-computes entire execution trace
+    /// @dev State is committed BEFORE each L1 call for synchronous composability
     /// @param prevL2BlockHash The L2 block hash before this transition
     /// @param callData The input data that was "called" on L2
-    /// @param resultL2BlockHash The L2 block hash after execution
-    /// @param outgoingCalls Array of L1 calls triggered by L2 execution
+    /// @param postExecutionStateHash The L2 state hash after L2 execution, BEFORE any L1 calls
+    /// @param outgoingCalls Array of L1 calls, each with its expected post-call state hash
     /// @param expectedResults Expected return data for each outgoing call
-    /// @param proof Proof of valid L2 state transition
+    /// @param proof Proof of valid L2 state transition chain
     function processCallOnL2(
         bytes32 prevL2BlockHash,
         bytes calldata callData,
-        bytes32 resultL2BlockHash,
-        Call[] calldata outgoingCalls,
+        bytes32 postExecutionStateHash,
+        OutgoingCall[] calldata outgoingCalls,
         bytes[] calldata expectedResults,
         bytes calldata proof
     ) external payable noReentrancy {
@@ -113,11 +129,11 @@ contract NativeRollupCore {
             revert InvalidPrevBlockHash(l2BlockHash, prevL2BlockHash);
         }
 
-        // Verify the proof
+        // Verify the proof covers the entire state transition chain
         if (!proofVerifier.verifyProof(
             prevL2BlockHash,
             callData,
-            resultL2BlockHash,
+            postExecutionStateHash,
             outgoingCalls,
             expectedResults,
             proof
@@ -125,20 +141,18 @@ contract NativeRollupCore {
             revert ProofVerificationFailed();
         }
 
-        // Note: msg.value represents deposits into the rollup
-        // Outgoing calls use previously deposited funds from contract balance
-        // The proof system ensures the state transition is valid
-
-        // Commit new state
-        bytes32 prevHash = l2BlockHash;
-        l2BlockHash = resultL2BlockHash;
+        // Increment block number
         l2BlockNumber++;
+        bytes32 prevHash = l2BlockHash;
 
-        emit L2BlockProcessed(l2BlockNumber, prevHash, resultL2BlockHash, outgoingCalls.length);
+        // Commit post-execution state BEFORE any L1 calls
+        // This ensures L1 contracts see the L2 state that includes this block's execution
+        l2BlockHash = postExecutionStateHash;
+        emit L2StateUpdated(l2BlockNumber, postExecutionStateHash, 0);
 
         // Execute outgoing L1 calls through L2SenderProxy contracts
         for (uint256 i = 0; i < outgoingCalls.length; i++) {
-            Call calldata c = outgoingCalls[i];
+            OutgoingCall calldata c = outgoingCalls[i];
 
             // Get or deploy the proxy for this L2 sender
             address proxy = _getOrDeployProxy(c.from);
@@ -161,7 +175,16 @@ contract NativeRollupCore {
             if (actualHash != expectedHash) {
                 revert UnexpectedCallResult(i, expectedHash, actualHash);
             }
+
+            // Commit the post-call L2 state
+            // This captures any L2 state changes caused by this L1 call (e.g., deposits)
+            l2BlockHash = c.postCallStateHash;
+            emit L2StateUpdated(l2BlockNumber, c.postCallStateHash, i + 1);
         }
+
+        // Emit the final block processed event
+        // Final state is either last call's postCallStateHash or postExecutionStateHash if no calls
+        emit L2BlockProcessed(l2BlockNumber, prevHash, l2BlockHash, outgoingCalls.length);
     }
 
     /// @notice Get the deterministic proxy address for an L2 address

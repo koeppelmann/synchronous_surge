@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Call, IProofVerifier} from "../interfaces/IProofVerifier.sol";
+import {OutgoingCall, IProofVerifier} from "../interfaces/IProofVerifier.sol";
 
 /// @title AdminProofVerifier
 /// @notice Simple admin-key proof verifier for POC
 /// @dev In production, replace with ZK verifier or TEE attestation verifier
+///
+/// The proof covers the entire state transition chain:
+/// prevBlockHash → postExecutionStateHash → call[0].postCallStateHash → call[1].postCallStateHash → ...
 contract AdminProofVerifier is IProofVerifier {
     address public admin;
     address public owner;
@@ -23,18 +26,19 @@ contract AdminProofVerifier is IProofVerifier {
     }
 
     /// @notice Verify a proof by checking admin signature
+    /// @dev Signature covers: prevBlockHash, callDataHash, postExecutionStateHash, callsHash, resultsHash
     function verifyProof(
         bytes32 prevBlockHash,
         bytes calldata callData,
-        bytes32 resultBlockHash,
-        Call[] calldata outgoingCalls,
+        bytes32 postExecutionStateHash,
+        OutgoingCall[] calldata outgoingCalls,
         bytes[] calldata expectedResults,
         bytes calldata proof
     ) external view override returns (bool) {
         bytes32 messageHash = keccak256(abi.encode(
             prevBlockHash,
             keccak256(callData),
-            resultBlockHash,
+            postExecutionStateHash,
             _hashCalls(outgoingCalls),
             _hashResults(expectedResults)
         ));
@@ -58,7 +62,9 @@ contract AdminProofVerifier is IProofVerifier {
         owner = _newOwner;
     }
 
-    function _hashCalls(Call[] calldata calls) internal pure returns (bytes32) {
+    /// @notice Hash all outgoing calls including their post-call state hashes
+    /// @dev Each call's postCallStateHash is included to verify the state transition chain
+    function _hashCalls(OutgoingCall[] calldata calls) internal pure returns (bytes32) {
         bytes memory encoded;
         for (uint256 i = 0; i < calls.length; i++) {
             encoded = abi.encodePacked(
@@ -67,7 +73,8 @@ contract AdminProofVerifier is IProofVerifier {
                 calls[i].target,
                 calls[i].value,
                 calls[i].gas,
-                keccak256(calls[i].data)
+                keccak256(calls[i].data),
+                calls[i].postCallStateHash  // Include post-call state in hash
             );
         }
         return keccak256(encoded);
