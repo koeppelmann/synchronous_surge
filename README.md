@@ -151,11 +151,50 @@ interface IProofVerifier {
 
 ## Current Deployment
 
-**Gnosis Mainnet:**
-| Contract | Address |
-|----------|---------|
-| NativeRollupCore | `0xA18282e7294342477013bfD224Bb66e47ca3164F` |
-| AdminProofVerifier | `0xBf0a7308545a0B8edC3326a0F54Cca692C1Ce379` |
+**Gnosis Mainnet (January 2026):**
+
+| Contract | Address | Verified |
+|----------|---------|----------|
+| NativeRollupCore | [`0x4240994d85109581B001183ab965D9e3d5fb2C2A`](https://gnosis.blockscout.com/address/0x4240994d85109581B001183ab965D9e3d5fb2C2A) | ✅ |
+| AdminProofVerifier | [`0x92d55056327CBFaF233bbfc3Fc9E8b38cedE4558`](https://gnosis.blockscout.com/address/0x92d55056327CBFaF233bbfc3Fc9E8b38cedE4558) | ✅ |
+
+**Configuration:**
+- Genesis Hash: `0xe491263b13dd2e2c3df6175dbe9057a0f2f7fcf14b63b6ccea6989ac16584ed6`
+- Admin/Owner: `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1`
+- Compiler: solc 0.8.27 (cancun)
+
+## Bidirectional L1↔L2 Sync
+
+The system supports both L2→L1 and L1→L2 synchronization:
+
+### L2→L1: Outgoing Calls
+L2 contracts include `OutgoingCall[]` in state transitions. The NativeRollupCore executes these calls on L1 via deterministic proxies.
+
+### L1→L2: Incoming Call Registry
+L1 contracts can call L2 contracts by pre-registering the expected L2 response:
+
+```solidity
+// 1. Prover registers expected L2 response
+nativeRollupCore.registerIncomingCall(
+    l2Address,
+    currentStateHash,
+    callData,
+    IncomingCallResponse({
+        preOutgoingCallsStateHash: newState,
+        outgoingCalls: [],
+        expectedResults: [],
+        returnValue: abi.encode(result),
+        finalStateHash: newState
+    }),
+    proof
+);
+
+// 2. L1 contract calls L2 proxy (which handles via NativeRollupCore)
+(bool success, bytes memory result) = l2Proxy.call(callData);
+```
+
+### SyncedCounter Example
+See `src/examples/SyncedCounter.sol` for a bidirectional sync example where L1 and L2 counters stay in sync regardless of which side is updated.
 
 ## License
 
