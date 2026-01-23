@@ -26,13 +26,14 @@ contract AdminProofVerifier is IProofVerifier {
     }
 
     /// @notice Verify a proof by checking admin signature
-    /// @dev Signature covers: prevBlockHash, callDataHash, postExecutionStateHash, callsHash, resultsHash
+    /// @dev Signature covers: prevBlockHash, callDataHash, postExecutionStateHash, callsHash, resultsHash, finalStateHash
     function verifyProof(
         bytes32 prevBlockHash,
         bytes calldata callData,
         bytes32 postExecutionStateHash,
         OutgoingCall[] calldata outgoingCalls,
         bytes[] calldata expectedResults,
+        bytes32 finalStateHash,
         bytes calldata proof
     ) external view override returns (bool) {
         bytes32 messageHash = keccak256(abi.encode(
@@ -40,7 +41,8 @@ contract AdminProofVerifier is IProofVerifier {
             keccak256(callData),
             postExecutionStateHash,
             _hashCalls(outgoingCalls),
-            _hashResults(expectedResults)
+            _hashResults(expectedResults),
+            finalStateHash
         ));
 
         bytes32 ethSignedMessageHash = keccak256(abi.encodePacked(

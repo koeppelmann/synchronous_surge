@@ -35,4 +35,20 @@ contract L2SenderProxy {
 
     /// @notice Allow receiving ETH
     receive() external payable {}
+
+    /// @notice Handle incoming calls to this L2 address
+    /// @dev Forwards the call to NativeRollupCore.handleIncomingCall()
+    /// @return The pre-registered return value
+    fallback(bytes calldata) external payable returns (bytes memory) {
+        // Forward the incoming call to NativeRollupCore
+        return INativeRollupCore(nativeRollup).handleIncomingCall(l2Address, msg.data);
+    }
+}
+
+/// @notice Interface for NativeRollupCore incoming call handling
+interface INativeRollupCore {
+    function handleIncomingCall(
+        address l2Address,
+        bytes calldata callData
+    ) external returns (bytes memory);
 }
