@@ -16,9 +16,11 @@ import {L2SenderProxy} from "./L2SenderProxy.sol";
 ///
 /// SYNCHRONOUS COMPOSABILITY:
 /// L1 calls can affect L2 state (e.g., deposits, callbacks). To handle this:
-/// - State is committed BEFORE each L1 call executes
+/// - State is committed BEFORE any L1 call executes (postExecutionStateHash)
 /// - Each outgoing call specifies its expected post-call L2 state hash
-/// - This allows L1 contracts to read consistent L2 state during execution
+/// - After each L1 call, we VERIFY l2BlockHash matches the expected post-call state
+/// - If the L1 call modified l2BlockHash (via callback), it must match expectation
+/// - If the L1 call didn't modify it, postCallStateHash should equal the pre-call state
 ///
 /// STATE TRANSITION CHAIN:
 /// prevBlockHash → postExecutionStateHash → call[0].postCallStateHash → call[1].postCallStateHash → ...
@@ -83,6 +85,7 @@ contract NativeRollupCore {
     error Reentrancy();
     error OutgoingCallFailed(uint256 index, address from, address target);
     error UnexpectedCallResult(uint256 index, bytes32 expected, bytes32 actual);
+    error UnexpectedPostCallState(uint256 index, bytes32 expected, bytes32 actual);
     error OnlyOwner();
 
     modifier onlyOwner() {
@@ -169,17 +172,22 @@ contract NativeRollupCore {
                 revert OutgoingCallFailed(i, c.from, c.target);
             }
 
-            // Verify the result matches expectation
-            bytes32 actualHash = keccak256(result);
-            bytes32 expectedHash = keccak256(expectedResults[i]);
-            if (actualHash != expectedHash) {
-                revert UnexpectedCallResult(i, expectedHash, actualHash);
+            // Verify the return data matches expectation
+            bytes32 actualResultHash = keccak256(result);
+            bytes32 expectedResultHash = keccak256(expectedResults[i]);
+            if (actualResultHash != expectedResultHash) {
+                revert UnexpectedCallResult(i, expectedResultHash, actualResultHash);
             }
 
-            // Commit the post-call L2 state
-            // This captures any L2 state changes caused by this L1 call (e.g., deposits)
-            l2BlockHash = c.postCallStateHash;
-            emit L2StateUpdated(l2BlockNumber, c.postCallStateHash, i + 1);
+            // Verify the post-call L2 state matches expectation
+            // The L1 call may have modified l2BlockHash as a side effect (e.g., deposit callback)
+            // If no side effect occurred, l2BlockHash should still equal the pre-call state
+            // Either way, it must match the expected postCallStateHash
+            if (l2BlockHash != c.postCallStateHash) {
+                revert UnexpectedPostCallState(i, c.postCallStateHash, l2BlockHash);
+            }
+
+            emit L2StateUpdated(l2BlockNumber, l2BlockHash, i + 1);
         }
 
         // Emit the final block processed event
