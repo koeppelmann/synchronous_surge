@@ -1,18 +1,13 @@
 /**
  * Native Rollup Builder
  *
- * The builder handles two types of L2 state transitions:
+ * The builder handles L2 state transitions by:
+ * 1. Receiving transactions from users (not from mempool)
+ * 2. Simulating on a local L2 Anvil to get real state roots
+ * 3. Registering the state transition on L1
+ * 4. Then submitting the user's transaction
  *
- * 1. L2 EOA Transactions:
- *    - User signs a transaction for L2 chain
- *    - Builder executes on L2 first to get state root
- *    - Builder creates and submits processCallOnL2() on L1
- *
- * 2. L1→L2 Contract Calls:
- *    - L1 contract wants to call L2 contract via proxy
- *    - Builder executes on L2 first to get state root and return value
- *    - Builder registers the incoming call response on L1
- *    - L1 contract can then call the proxy
+ * This ensures state roots on L1 match what fullnodes compute.
  *
  * The builder is the "prover" in POC mode - it signs proofs with admin key.
  * In production, this would be replaced with ZK proofs.
@@ -25,27 +20,28 @@ import {
   Wallet,
   AbiCoder,
   keccak256,
-  Transaction,
-  TransactionLike,
 } from "ethers";
+import { spawn, ChildProcess } from "child_process";
 
 // ============ Configuration ============
 
 export interface BuilderConfig {
   l1Rpc: string;
-  l2Rpc: string;
   rollupAddress: string;
-  adminPrivateKey: string; // For signing proofs (POC only)
+  adminPrivateKey: string;
+  l2Port: number;
+  l2ChainId: number;
 }
 
 const DEFAULT_CONFIG: BuilderConfig = {
-  l1Rpc: process.env.L1_RPC || "http://localhost:9545",
-  l2Rpc: process.env.L2_RPC || "http://localhost:9546",
+  l1Rpc: process.env.L1_RPC || "https://rpc.gnosischain.com",
   rollupAddress:
-    process.env.ROLLUP_ADDRESS || "0x4240994d85109581B001183ab965D9e3d5fb2C2A",
+    process.env.ROLLUP_ADDRESS || "0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d",
   adminPrivateKey:
     process.env.ADMIN_PK ||
     "0xf2024347d89be67338b62344010fb2ebc5db60cad2ff591a92a30b8215f87f22",
+  l2Port: parseInt(process.env.L2_PORT || "9547"), // Different from fullnode default
+  l2ChainId: parseInt(process.env.L2_CHAIN_ID || "10200200"),
 };
 
 // ============ ABI ============
@@ -56,42 +52,30 @@ const ROLLUP_ABI = [
   "function getProxyAddress(address l2Address) view returns (address)",
   "function isProxyDeployed(address l2Address) view returns (bool)",
   "function deployProxy(address l2Address) returns (address)",
-  "function processCallOnL2(bytes32 prevL2BlockHash, bytes calldata callData, bytes32 postExecutionStateHash, tuple(address from, address target, uint256 value, uint256 gas, bytes data, bytes32 postCallStateHash)[] outgoingCalls, bytes[] expectedResults, bytes32 finalStateHash, bytes proof) payable",
   "function registerIncomingCall(address l2Address, bytes32 stateHash, bytes calldata callData, tuple(bytes32 preOutgoingCallsStateHash, tuple(address from, address target, uint256 value, uint256 gas, bytes data, bytes32 postCallStateHash)[] outgoingCalls, bytes[] expectedResults, bytes returnValue, bytes32 finalStateHash) response, bytes proof)",
+  "event IncomingCallHandled(address indexed l2Address, bytes32 indexed responseKey, uint256 outgoingCallsCount, uint256 value)",
 ];
 
 // ============ Types ============
 
-export interface L2Transaction {
-  from: string;
-  to: string;
-  value?: bigint;
-  data?: string;
-  nonce?: number;
-  gasLimit?: bigint;
-  gasPrice?: bigint;
-}
-
-export interface IncomingCallRequest {
-  l1Caller: string; // The L1 contract that will call the L2 proxy
-  l2Target: string; // The L2 contract being called
-  callData: string; // The calldata for the L2 call
-  value?: bigint; // Optional value
+/**
+ * A deposit request from a user
+ */
+export interface DepositRequest {
+  l2Recipient: string;
+  value: bigint;
+  callData?: string;
 }
 
 export interface BuildResult {
   success: boolean;
   l1TxHash?: string;
-  l2TxHash?: string;
   l2StateRoot?: string;
   error?: string;
 }
 
 // ============ Utility Functions ============
 
-/**
- * Compute the L2 proxy address for an L1 address
- */
 export function computeL2ProxyAddress(l1Address: string): string {
   const hash = keccak256(
     AbiCoder.defaultAbiCoder().encode(
@@ -107,14 +91,15 @@ export function computeL2ProxyAddress(l1Address: string): string {
 export class Builder {
   private config: BuilderConfig;
   private l1Provider: JsonRpcProvider;
-  private l2Provider: JsonRpcProvider;
+  private l2Provider!: JsonRpcProvider;
   private adminWallet: Wallet;
   private rollupCore: Contract;
+  private anvilProcess: ChildProcess | null = null;
+  private isReady: boolean = false;
 
   constructor(config: Partial<BuilderConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.l1Provider = new JsonRpcProvider(this.config.l1Rpc);
-    this.l2Provider = new JsonRpcProvider(this.config.l2Rpc);
     this.adminWallet = new Wallet(this.config.adminPrivateKey, this.l1Provider);
     this.rollupCore = new Contract(
       this.config.rollupAddress,
@@ -124,474 +109,231 @@ export class Builder {
   }
 
   /**
-   * Get current L2 state from L1
+   * Start the builder - spawn L2 Anvil
    */
-  async getL2State(): Promise<{ blockNumber: bigint; blockHash: string }> {
-    const [blockNumber, blockHash] = await Promise.all([
-      this.rollupCore.l2BlockNumber(),
-      this.rollupCore.l2BlockHash(),
-    ]);
-    return { blockNumber, blockHash };
-  }
+  async start(): Promise<void> {
+    console.log("=== Native Rollup Builder ===");
+    console.log(`L1 RPC: ${this.config.l1Rpc}`);
+    console.log(`NativeRollupCore: ${this.config.rollupAddress}`);
+    console.log(`Admin: ${this.adminWallet.address}`);
+    console.log("");
 
-  /**
-   * Get actual L2 state root from L2 chain
-   */
-  async getL2StateRoot(): Promise<string> {
-    const block = await this.l2Provider.getBlock("latest");
-    return block?.stateRoot || "";
-  }
+    // Spawn L2 Anvil
+    await this.spawnL2Anvil();
 
-  // ================================================================
-  // Case 1: Build L2 EOA Transaction
-  // ================================================================
+    // Get current L2 state from L1
+    const l2BlockHash = await this.rollupCore.l2BlockHash();
+    const l2BlockNumber = await this.rollupCore.l2BlockNumber();
 
-  /**
-   * Build and submit an L2 EOA transaction
-   *
-   * Flow:
-   * 1. Execute transaction on L2 first (via raw tx or impersonation)
-   * 2. Get resulting L2 state root
-   * 3. Sign proof with admin key
-   * 4. Submit processCallOnL2() on L1
-   *
-   * @param signedTx - RLP-encoded signed transaction for L2
-   */
-  async buildL2Transaction(signedTx: string): Promise<BuildResult> {
-    console.log("=== Building L2 Transaction ===");
+    console.log(`Current L2 state on L1:`);
+    console.log(`  Block number: ${l2BlockNumber}`);
+    console.log(`  Block hash: ${l2BlockHash}`);
 
-    try {
-      // Get current L2 state from L1
-      const l2State = await this.getL2State();
-      console.log(`Current L2 block hash on L1: ${l2State.blockHash}`);
+    // Check if L2 state matches
+    const l2Block = await this.l2Provider.getBlock("latest");
+    const l2StateRoot = l2Block?.stateRoot;
 
-      // Step 1: Execute on L2 first
-      console.log("Step 1: Executing on L2...");
+    console.log(`Local L2 state root: ${l2StateRoot}`);
 
-      const l2TxHash = await this.l2Provider.send("eth_sendRawTransaction", [
-        signedTx,
-      ]);
-      console.log(`  L2 tx hash: ${l2TxHash}`);
-
-      const l2Receipt = await this.l2Provider.waitForTransaction(l2TxHash);
-      if (l2Receipt?.status !== 1) {
-        return { success: false, error: "L2 transaction reverted" };
-      }
-      console.log(`  L2 tx confirmed`);
-
-      // Step 2: Get new L2 state root
-      const l2Block = await this.l2Provider.getBlock("latest");
-      const l2StateRoot = l2Block?.stateRoot;
-      if (!l2StateRoot) {
-        return { success: false, error: "Failed to get L2 state root" };
-      }
-      console.log(`  L2 state root: ${l2StateRoot}`);
-
-      // Step 3: Sign proof
-      console.log("Step 2: Signing proof...");
-
-      const proof = await this.signProcessCallProof(
-        l2State.blockHash,
-        signedTx,
-        l2StateRoot,
-        [], // No outgoing calls for EOA tx
-        [], // No expected results
-        l2StateRoot // Final state = post execution state
-      );
-
-      // Step 4: Submit processCallOnL2 on L1
-      console.log("Step 3: Submitting to L1...");
-
-      const l1Tx = await this.rollupCore.processCallOnL2(
-        l2State.blockHash,
-        signedTx,
-        l2StateRoot,
-        [], // No outgoing calls
-        [], // No expected results
-        l2StateRoot,
-        proof
-      );
-
-      const l1Receipt = await l1Tx.wait();
-      console.log(`  L1 tx hash: ${l1Receipt?.hash}`);
-      console.log(
-        `  L1 tx status: ${l1Receipt?.status === 1 ? "success" : "failed"}`
-      );
-
-      // Verify final state
-      const finalL2Hash = await this.rollupCore.l2BlockHash();
-      console.log(`\nFinal L2 block hash on L1: ${finalL2Hash}`);
-      console.log(
-        `Match: ${finalL2Hash.toLowerCase() === l2StateRoot.toLowerCase() ? "YES" : "NO"}`
-      );
-
-      return {
-        success: true,
-        l1TxHash: l1Receipt?.hash,
-        l2TxHash,
-        l2StateRoot,
-      };
-    } catch (err: any) {
-      console.error("Error:", err.message);
-      return { success: false, error: err.message };
+    if (l2BlockHash.toLowerCase() === l2StateRoot?.toLowerCase()) {
+      console.log(`✓ State roots match!`);
+    } else {
+      console.log(`⚠ State roots don't match yet (fresh Anvil)`);
+      // This is expected for a fresh Anvil - state will match after first operation
     }
+
+    this.isReady = true;
+    console.log("\nBuilder ready to accept transactions.");
   }
 
   /**
-   * Build and submit an L2 transaction from unsigned tx data
-   * Uses impersonation on L2 (Anvil only)
+   * Spawn L2 Anvil instance
    */
-  async buildL2TransactionUnsigned(tx: L2Transaction): Promise<BuildResult> {
-    console.log("=== Building L2 Transaction (Unsigned) ===");
-    console.log(`From: ${tx.from}`);
-    console.log(`To: ${tx.to}`);
+  private async spawnL2Anvil(): Promise<void> {
+    const l2Rpc = `http://localhost:${this.config.l2Port}`;
 
-    try {
-      // Get current L2 state from L1
-      const l2State = await this.getL2State();
-      console.log(`Current L2 block hash on L1: ${l2State.blockHash}`);
+    console.log(`Spawning L2 Anvil on port ${this.config.l2Port}...`);
 
-      // Step 1: Execute on L2 via impersonation
-      console.log("Step 1: Executing on L2...");
-
-      await this.l2Provider.send("anvil_impersonateAccount", [tx.from]);
-
-      // Ensure from has balance for gas
-      const balance = await this.l2Provider.getBalance(tx.from);
-      if (balance < ethers.parseEther("0.1")) {
-        await this.l2Provider.send("anvil_setBalance", [
-          tx.from,
-          "0x" + ethers.parseEther("1").toString(16),
-        ]);
+    this.anvilProcess = spawn(
+      "anvil",
+      [
+        "--port",
+        this.config.l2Port.toString(),
+        "--chain-id",
+        this.config.l2ChainId.toString(),
+        "--silent",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
       }
+    );
 
-      const signer = await this.l2Provider.getSigner(tx.from);
-      const l2Tx = await signer.sendTransaction({
-        to: tx.to,
-        value: tx.value || 0n,
-        data: tx.data || "0x",
+    // Wait for Anvil to be ready
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("Anvil failed to start within 10 seconds"));
+      }, 10000);
+
+      const checkReady = async () => {
+        try {
+          const provider = new JsonRpcProvider(l2Rpc);
+          await provider.getBlockNumber();
+          clearTimeout(timeout);
+          resolve();
+        } catch {
+          setTimeout(checkReady, 100);
+        }
+      };
+
+      this.anvilProcess!.on("error", (err) => {
+        clearTimeout(timeout);
+        reject(new Error(`Failed to spawn Anvil: ${err.message}`));
       });
 
-      const l2Receipt = await l2Tx.wait();
-      await this.l2Provider.send("anvil_stopImpersonatingAccount", [tx.from]);
+      checkReady();
+    });
 
-      if (l2Receipt?.status !== 1) {
-        return { success: false, error: "L2 transaction reverted" };
-      }
-      console.log(`  L2 tx hash: ${l2Receipt.hash}`);
-
-      // Step 2: Get new L2 state root
-      const l2Block = await this.l2Provider.getBlock("latest");
-      const l2StateRoot = l2Block?.stateRoot;
-      if (!l2StateRoot) {
-        return { success: false, error: "Failed to get L2 state root" };
-      }
-      console.log(`  L2 state root: ${l2StateRoot}`);
-
-      // Step 3: Create callData representation
-      // For unsigned tx, we encode it as: (from, to, value, data)
-      const callData = AbiCoder.defaultAbiCoder().encode(
-        ["address", "address", "uint256", "bytes"],
-        [tx.from, tx.to, tx.value || 0n, tx.data || "0x"]
-      );
-
-      // Step 4: Sign proof
-      console.log("Step 2: Signing proof...");
-
-      const proof = await this.signProcessCallProof(
-        l2State.blockHash,
-        callData,
-        l2StateRoot,
-        [],
-        [],
-        l2StateRoot
-      );
-
-      // Step 5: Submit processCallOnL2 on L1
-      console.log("Step 3: Submitting to L1...");
-
-      const l1Tx = await this.rollupCore.processCallOnL2(
-        l2State.blockHash,
-        callData,
-        l2StateRoot,
-        [],
-        [],
-        l2StateRoot,
-        proof
-      );
-
-      const l1Receipt = await l1Tx.wait();
-      console.log(`  L1 tx hash: ${l1Receipt?.hash}`);
-
-      return {
-        success: true,
-        l1TxHash: l1Receipt?.hash,
-        l2TxHash: l2Receipt.hash,
-        l2StateRoot,
-      };
-    } catch (err: any) {
-      console.error("Error:", err.message);
-      return { success: false, error: err.message };
-    }
+    this.l2Provider = new JsonRpcProvider(l2Rpc);
+    console.log(`L2 Anvil ready at ${l2Rpc}`);
   }
 
-  // ================================================================
-  // Case 2: Build L1→L2 Incoming Call
-  // ================================================================
-
   /**
-   * Prepare an L1→L2 incoming call
+   * Process a deposit request
    *
    * Flow:
-   * 1. Execute the call on L2 first (impersonate L1 caller's proxy)
-   * 2. Get L2 state root and return value
-   * 3. Register incoming call response on L1
-   * 4. Returns the L2 proxy address that L1 should call
-   *
-   * After this, the L1 contract can call the L2 proxy and it will
-   * return the pre-registered response.
+   * 1. Deploy proxy on L1 if needed
+   * 2. Simulate deposit on local L2 to get real state root
+   * 3. Register incoming call on L1 with real state root
+   * 4. Execute the deposit (call proxy with value)
    */
-  async prepareIncomingCall(request: IncomingCallRequest): Promise<BuildResult> {
-    console.log("=== Preparing L1→L2 Incoming Call ===");
-    console.log(`L1 Caller: ${request.l1Caller}`);
-    console.log(`L2 Target: ${request.l2Target}`);
+  async processDeposit(request: DepositRequest): Promise<BuildResult> {
+    if (!this.isReady) {
+      return { success: false, error: "Builder not ready. Call start() first." };
+    }
+
+    console.log(`\n=== Processing Deposit ===`);
+    console.log(`L2 Recipient: ${request.l2Recipient}`);
+    console.log(`Value: ${ethers.formatEther(request.value)} xDAI`);
 
     try {
-      // Get current L2 state from L1
-      const l2State = await this.getL2State();
-      console.log(`Current L2 block hash on L1: ${l2State.blockHash}`);
+      // Step 1: Get current L2 state from L1
+      const currentL2Hash = await this.rollupCore.l2BlockHash();
+      console.log(`Current L2 hash on L1: ${currentL2Hash}`);
 
-      // Compute L1 caller's proxy on L2
-      const l1CallerProxyOnL2 = computeL2ProxyAddress(request.l1Caller);
-      console.log(`L1 caller's proxy on L2: ${l1CallerProxyOnL2}`);
+      // Step 2: Deploy proxy on L1 if needed
+      const isDeployed = await this.rollupCore.isProxyDeployed(request.l2Recipient);
+      let proxyAddress = await this.rollupCore.getProxyAddress(request.l2Recipient);
 
-      // Step 1: Execute on L2 first
-      console.log("Step 1: Executing on L2...");
-      if (request.value && request.value > 0n) {
-        console.log(`  Depositing: ${ethers.formatEther(request.value)} ETH`);
+      if (!isDeployed) {
+        console.log(`Deploying proxy for ${request.l2Recipient}...`);
+        const deployTx = await this.rollupCore.deployProxy(request.l2Recipient);
+        await deployTx.wait();
+        console.log(`  Proxy deployed at: ${proxyAddress}`);
+      } else {
+        console.log(`Proxy already deployed at: ${proxyAddress}`);
       }
 
+      // Step 3: Simulate the deposit on local L2
+      console.log(`Simulating deposit on local L2...`);
+
+      // Compute the L1 caller's proxy on L2
+      const l1Caller = this.adminWallet.address;
+      const l1CallerProxyOnL2 = computeL2ProxyAddress(l1Caller);
+      console.log(`  L1 caller proxy on L2: ${l1CallerProxyOnL2}`);
+
+      // Impersonate and execute on L2
       await this.l2Provider.send("anvil_impersonateAccount", [l1CallerProxyOnL2]);
 
-      // Get current balance and add: deposit value + gas allowance
-      // The deposit value is "minted" deterministically from L1
-      const currentBalance = await this.l2Provider.getBalance(l1CallerProxyOnL2);
-      const depositValue = request.value || 0n;
+      // Give the proxy enough balance for gas + deposit
       const gasAllowance = ethers.parseEther("0.1");
-      const newBalance = currentBalance + depositValue + gasAllowance;
-
       await this.l2Provider.send("anvil_setBalance", [
         l1CallerProxyOnL2,
-        "0x" + newBalance.toString(16),
+        "0x" + (request.value + gasAllowance).toString(16),
       ]);
 
+      // Execute the deposit
       const l2Signer = await this.l2Provider.getSigner(l1CallerProxyOnL2);
       const l2Tx = await l2Signer.sendTransaction({
-        to: request.l2Target,
-        value: request.value || 0n,
-        data: request.callData,
+        to: request.l2Recipient,
+        value: request.value,
+        data: request.callData || "0x",
       });
+      await l2Tx.wait();
 
-      const l2Receipt = await l2Tx.wait();
-      await this.l2Provider.send("anvil_stopImpersonatingAccount", [
-        l1CallerProxyOnL2,
-      ]);
+      await this.l2Provider.send("anvil_stopImpersonatingAccount", [l1CallerProxyOnL2]);
 
-      console.log(`  L2 tx hash: ${l2Receipt?.hash}`);
-      console.log(
-        `  L2 tx status: ${l2Receipt?.status === 1 ? "success" : "reverted"}`
-      );
-
-      // Step 2: Get L2 state root
-      const l2Block = await this.l2Provider.getBlock("latest");
-      const l2StateRoot = l2Block?.stateRoot;
-      if (!l2StateRoot) {
-        return { success: false, error: "Failed to get L2 state root" };
+      // Get the new state root
+      const newBlock = await this.l2Provider.getBlock("latest");
+      const newStateRoot = newBlock?.stateRoot;
+      if (!newStateRoot) {
+        return { success: false, error: "Failed to get new L2 state root" };
       }
-      console.log(`  L2 state root: ${l2StateRoot}`);
+      console.log(`  New L2 state root: ${newStateRoot}`);
 
-      // Step 3: Extract return value from logs (if any)
-      // For now, use empty return value - in production would simulate
-      // TODO: Actually capture return value from eth_call
-      let returnValue = "0x";
+      // Step 4: Register incoming call on L1 with the real state root
+      console.log(`Registering incoming call on L1...`);
 
-      // Try to get return value by simulating the call
-      try {
-        returnValue = await this.l2Provider.call({
-          from: l1CallerProxyOnL2,
-          to: request.l2Target,
-          data: request.callData,
-        });
-      } catch {
-        // If simulation fails, use empty return value
-      }
-      console.log(`  Return value: ${returnValue}`);
-
-      // Step 4: Sign proof for registerIncomingCall
-      console.log("Step 2: Signing proof...");
-
-      const proof = await this.signIncomingCallProof(
-        request.l2Target,
-        l2State.blockHash,
-        request.callData,
-        l2StateRoot, // preOutgoingCallsStateHash
-        keccak256("0x"), // outgoingCallsHash (empty)
-        keccak256("0x"), // resultsHash (empty)
-        keccak256(returnValue), // returnValueHash
-        l2StateRoot // finalStateHash
-      );
-
-      // Step 5: Register on L1
-      console.log("Step 3: Registering on L1...");
-
+      const callData = request.callData || "0x";
       const response = {
-        preOutgoingCallsStateHash: l2StateRoot,
+        preOutgoingCallsStateHash: newStateRoot,
         outgoingCalls: [],
         expectedResults: [],
-        returnValue: returnValue,
-        finalStateHash: l2StateRoot,
+        returnValue: "0x",
+        finalStateHash: newStateRoot,
       };
 
-      const l1Tx = await this.rollupCore.registerIncomingCall(
-        request.l2Target,
-        l2State.blockHash,
-        request.callData,
+      const proof = await this.signIncomingCallProof(
+        request.l2Recipient,
+        currentL2Hash,
+        callData,
+        newStateRoot,
+        keccak256("0x"),
+        keccak256("0x"),
+        keccak256("0x"),
+        newStateRoot
+      );
+
+      const registerTx = await this.rollupCore.registerIncomingCall(
+        request.l2Recipient,
+        currentL2Hash,
+        callData,
         response,
         proof
       );
+      const registerReceipt = await registerTx.wait();
+      console.log(`  Register tx: ${registerReceipt?.hash}`);
 
-      const l1Receipt = await l1Tx.wait();
-      console.log(`  L1 tx hash: ${l1Receipt?.hash}`);
+      // Step 5: Execute the deposit on L1 (call proxy with value)
+      console.log(`Executing deposit on L1...`);
 
-      // Get the L2 proxy address on L1 that should be called
-      const l2ProxyOnL1 = await this.rollupCore.getProxyAddress(request.l2Target);
+      const depositTx = await this.adminWallet.sendTransaction({
+        to: proxyAddress,
+        value: request.value,
+        data: request.callData || "0x",
+      });
+      const depositReceipt = await depositTx.wait();
+      console.log(`  Deposit tx: ${depositReceipt?.hash}`);
 
-      // Ensure proxy is deployed
-      const isDeployed = await this.rollupCore.isProxyDeployed(request.l2Target);
-      if (!isDeployed) {
-        console.log("  Deploying L2 proxy on L1...");
-        const deployTx = await this.rollupCore.deployProxy(request.l2Target);
-        await deployTx.wait();
+      // Verify final state
+      const finalL2Hash = await this.rollupCore.l2BlockHash();
+      console.log(`\nFinal L2 hash on L1: ${finalL2Hash}`);
+      console.log(`Expected (local):    ${newStateRoot}`);
+
+      if (finalL2Hash.toLowerCase() === newStateRoot.toLowerCase()) {
+        console.log(`✓ State roots match!`);
+      } else {
+        console.log(`✗ State roots don't match!`);
       }
-
-      console.log(`\n✓ Ready! L1 can now call proxy at: ${l2ProxyOnL1}`);
-      console.log(`  with calldata: ${request.callData}`);
 
       return {
         success: true,
-        l1TxHash: l1Receipt?.hash,
-        l2TxHash: l2Receipt?.hash,
-        l2StateRoot,
+        l1TxHash: depositReceipt?.hash,
+        l2StateRoot: newStateRoot,
       };
     } catch (err: any) {
-      console.error("Error:", err.message);
+      console.error(`Error: ${err.message}`);
       return { success: false, error: err.message };
     }
-  }
-
-  /**
-   * Execute an L1 transaction that calls an L2 proxy
-   *
-   * This is a convenience method that:
-   * 1. Prepares the incoming call (executes on L2, registers response)
-   * 2. Executes the L1 transaction that calls the proxy
-   */
-  async executeL1ToL2Call(
-    l1Caller: string,
-    l2Target: string,
-    callData: string,
-    value?: bigint
-  ): Promise<BuildResult> {
-    console.log("=== Execute L1→L2 Call ===");
-
-    // Step 1: Prepare the incoming call
-    const prepResult = await this.prepareIncomingCall({
-      l1Caller,
-      l2Target,
-      callData,
-      value,
-    });
-
-    if (!prepResult.success) {
-      return prepResult;
-    }
-
-    // Step 2: Execute the L1 call to the proxy
-    console.log("\nStep 4: Executing L1 call to proxy...");
-
-    const l2ProxyOnL1 = await this.rollupCore.getProxyAddress(l2Target);
-
-    // Impersonate L1 caller and call the proxy
-    await this.l1Provider.send("anvil_impersonateAccount", [l1Caller]);
-
-    const callerBalance = await this.l1Provider.getBalance(l1Caller);
-    if (callerBalance < ethers.parseEther("0.1")) {
-      await this.l1Provider.send("anvil_setBalance", [
-        l1Caller,
-        "0x" + ethers.parseEther("1").toString(16),
-      ]);
-    }
-
-    const l1Signer = await this.l1Provider.getSigner(l1Caller);
-    const l1Tx = await l1Signer.sendTransaction({
-      to: l2ProxyOnL1,
-      value: value || 0n,
-      data: callData,
-    });
-
-    const l1Receipt = await l1Tx.wait();
-    await this.l1Provider.send("anvil_stopImpersonatingAccount", [l1Caller]);
-
-    console.log(`  L1 tx hash: ${l1Receipt?.hash}`);
-    console.log(
-      `  L1 tx status: ${l1Receipt?.status === 1 ? "success" : "failed"}`
-    );
-
-    // Verify final state
-    const finalL2Hash = await this.rollupCore.l2BlockHash();
-    console.log(`\nFinal L2 block hash on L1: ${finalL2Hash}`);
-    console.log(`L2 state root: ${prepResult.l2StateRoot}`);
-
-    return {
-      ...prepResult,
-      l1TxHash: l1Receipt?.hash,
-    };
-  }
-
-  // ================================================================
-  // Proof Signing (POC - Admin Signature)
-  // ================================================================
-
-  /**
-   * Sign proof for processCallOnL2
-   */
-  private async signProcessCallProof(
-    prevBlockHash: string,
-    callData: string,
-    postExecutionStateHash: string,
-    outgoingCalls: any[],
-    expectedResults: string[],
-    finalStateHash: string
-  ): Promise<string> {
-    // Compute message hash matching IProofVerifier
-    const outgoingCallsHash = this.hashOutgoingCalls(outgoingCalls);
-    const resultsHash = this.hashResults(expectedResults);
-
-    const messageHash = keccak256(
-      AbiCoder.defaultAbiCoder().encode(
-        ["bytes32", "bytes32", "bytes32", "bytes32", "bytes32", "bytes32"],
-        [
-          prevBlockHash,
-          keccak256(callData),
-          postExecutionStateHash,
-          outgoingCallsHash,
-          resultsHash,
-          finalStateHash,
-        ]
-      )
-    );
-
-    return await this.adminWallet.signMessage(ethers.getBytes(messageHash));
   }
 
   /**
@@ -636,41 +378,41 @@ export class Builder {
   }
 
   /**
-   * Hash outgoing calls array
+   * Get current status
    */
-  private hashOutgoingCalls(calls: any[]): string {
-    if (calls.length === 0) return keccak256("0x");
+  async getStatus(): Promise<{
+    l1BlockHash: string;
+    l2StateRoot: string;
+    synced: boolean;
+  }> {
+    const l1BlockHash = await this.rollupCore.l2BlockHash();
+    const l2Block = await this.l2Provider.getBlock("latest");
+    const l2StateRoot = l2Block?.stateRoot || "0x0";
 
-    let encoded = "0x";
-    for (const call of calls) {
-      encoded += AbiCoder.defaultAbiCoder()
-        .encode(
-          ["address", "address", "uint256", "uint256", "bytes32", "bytes32"],
-          [
-            call.from,
-            call.target,
-            call.value,
-            call.gas,
-            keccak256(call.data),
-            call.postCallStateHash,
-          ]
-        )
-        .slice(2);
-    }
-    return keccak256(encoded);
+    return {
+      l1BlockHash,
+      l2StateRoot,
+      synced: l1BlockHash.toLowerCase() === l2StateRoot.toLowerCase(),
+    };
   }
 
   /**
-   * Hash expected results array
+   * Stop the builder
    */
-  private hashResults(results: string[]): string {
-    if (results.length === 0) return keccak256("0x");
-
-    let encoded = "0x";
-    for (const result of results) {
-      encoded += keccak256(result).slice(2);
+  stop(): void {
+    if (this.anvilProcess) {
+      console.log("Stopping L2 Anvil...");
+      this.anvilProcess.kill();
+      this.anvilProcess = null;
     }
-    return keccak256(encoded);
+    console.log("Builder stopped.");
+  }
+
+  /**
+   * Get the L2 RPC URL
+   */
+  getL2Rpc(): string {
+    return `http://localhost:${this.config.l2Port}`;
   }
 }
 
@@ -682,139 +424,77 @@ async function main() {
 
   const builder = new Builder();
 
+  // Handle graceful shutdown
+  process.on("SIGINT", () => {
+    console.log("\nShutting down...");
+    builder.stop();
+    process.exit(0);
+  });
+
   switch (command) {
-    case "l2-tx": {
-      // Build L2 transaction from: from, to, value, data
-      const from = args[1];
-      const to = args[2];
-      const value = args[3] ? BigInt(args[3]) : 0n;
-      const data = args[4] || "0x";
-
-      if (!from || !to) {
-        console.log("Usage: npx tsx builder/index.ts l2-tx <from> <to> [value] [data]");
-        process.exit(1);
-      }
-
-      const result = await builder.buildL2TransactionUnsigned({
-        from,
-        to,
-        value,
-        data,
-      });
-
-      console.log("\nResult:", result);
-      break;
-    }
-
-    case "l1-to-l2": {
-      // Build L1→L2 call: l1Caller, l2Target, callData
-      const l1Caller = args[1];
-      const l2Target = args[2];
-      const callData = args[3] || "0x";
-
-      if (!l1Caller || !l2Target) {
-        console.log(
-          "Usage: npx tsx builder/index.ts l1-to-l2 <l1Caller> <l2Target> [callData]"
-        );
-        process.exit(1);
-      }
-
-      const result = await builder.executeL1ToL2Call(l1Caller, l2Target, callData);
-
-      console.log("\nResult:", result);
-      break;
-    }
-
-    case "prepare": {
-      // Prepare incoming call only (don't execute L1)
-      const l1Caller = args[1];
-      const l2Target = args[2];
-      const callData = args[3] || "0x";
-
-      if (!l1Caller || !l2Target) {
-        console.log(
-          "Usage: npx tsx builder/index.ts prepare <l1Caller> <l2Target> [callData]"
-        );
-        process.exit(1);
-      }
-
-      const result = await builder.prepareIncomingCall({
-        l1Caller,
-        l2Target,
-        callData,
-      });
-
-      console.log("\nResult:", result);
-      break;
-    }
-
     case "deposit": {
-      // Deposit xDAI to an L2 EOA
-      const l1Caller = args[1]; // Any L1 address (will be impersonated)
-      const l2Recipient = args[2]; // EOA to receive funds on L2
-      const amount = args[3]; // Amount in wei
+      // deposit <l2Recipient> <amountEther>
+      const l2Recipient = args[1];
+      const amountEther = args[2];
 
-      if (!l1Caller || !l2Recipient || !amount) {
-        console.log(
-          "Usage: npx tsx builder/index.ts deposit <l1Caller> <l2Recipient> <amountWei>"
-        );
-        console.log(
-          "\nExample: npx tsx builder/index.ts deposit 0xf39F... 0x7B2e... 1000000000000000000"
-        );
+      if (!l2Recipient || !amountEther) {
+        console.log("Usage: npx tsx builder/index.ts deposit <l2Recipient> <amountEther>");
+        console.log("Example: npx tsx builder/index.ts deposit 0x7B2e78D4dFaABA045A167a70dA285E30E8FcA196 0.01");
         process.exit(1);
       }
 
-      console.log(`Depositing ${ethers.formatEther(amount)} xDAI to ${l2Recipient}`);
+      await builder.start();
 
-      const result = await builder.executeL1ToL2Call(
-        l1Caller,
+      const result = await builder.processDeposit({
         l2Recipient,
-        "0x", // No calldata - just value transfer to EOA
-        BigInt(amount)
-      );
+        value: ethers.parseEther(amountEther),
+      });
 
-      console.log("\nResult:", result);
+      if (result.success) {
+        console.log("\n=== Deposit Complete ===");
+        console.log(`L1 Tx: ${result.l1TxHash}`);
+        console.log(`L2 State Root: ${result.l2StateRoot}`);
+      } else {
+        console.error(`\nDeposit failed: ${result.error}`);
+      }
+
+      builder.stop();
       break;
     }
 
     case "status": {
-      const l2State = await builder.getL2State();
-      const l2StateRoot = await builder.getL2StateRoot();
+      await builder.start();
+      const status = await builder.getStatus();
 
-      console.log("=== Builder Status ===");
-      console.log(`L2 Block Number (L1): ${l2State.blockNumber}`);
-      console.log(`L2 Block Hash (L1):   ${l2State.blockHash}`);
-      console.log(`L2 State Root (L2):   ${l2StateRoot}`);
-      console.log(
-        `Match: ${l2State.blockHash.toLowerCase() === l2StateRoot.toLowerCase() ? "YES" : "NO"}`
-      );
+      console.log("\n=== Status ===");
+      console.log(`L1 Block Hash: ${status.l1BlockHash}`);
+      console.log(`L2 State Root: ${status.l2StateRoot}`);
+      console.log(`Synced: ${status.synced ? "YES" : "NO"}`);
+
+      builder.stop();
       break;
     }
 
-    default:
+    default: {
       console.log("Native Rollup Builder");
       console.log("");
       console.log("Commands:");
-      console.log("  l2-tx <from> <to> [value] [data]      - Build L2 EOA transaction");
-      console.log("  l1-to-l2 <l1Caller> <l2Target> [data] - Execute L1→L2 call");
-      console.log("  deposit <l1Caller> <l2Recipient> <wei> - Deposit xDAI to L2 EOA");
-      console.log("  prepare <l1Caller> <l2Target> [data]  - Prepare incoming call only");
+      console.log("  deposit <l2Recipient> <amountEther>  - Deposit xDAI to L2 address");
       console.log("  status                                - Show current state");
       console.log("");
       console.log("Examples:");
-      console.log(
-        "  npx tsx builder/index.ts l2-tx 0xf39F... 0x7B2e... 1000000000000000000"
-      );
-      console.log(
-        "  npx tsx builder/index.ts deposit 0xf39F... 0x7B2e... 1000000000000000000"
-      );
-      console.log(
-        "  npx tsx builder/index.ts l1-to-l2 0xd30b... 0xe7f1... 0x55241077..."
-      );
+      console.log("  npx tsx builder/index.ts deposit 0x7B2e78D4dFaABA045A167a70dA285E30E8FcA196 0.01");
+      console.log("  npx tsx builder/index.ts status");
+      process.exit(0);
+    }
   }
 }
 
-// Run if executed directly
-if (process.argv[1]?.includes('builder')) {
-  main().catch(console.error);
+if (process.argv[1]?.includes("builder")) {
+  main().catch((err) => {
+    console.error("Builder error:", err);
+    process.exit(1);
+  });
 }
+
+export { Builder as default };

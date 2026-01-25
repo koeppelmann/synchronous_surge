@@ -307,10 +307,16 @@ await l2Signer.sendTransaction({ to: l2Address, data: callData });
 
 **Gnosis Mainnet (January 2026):**
 
-| Contract | Address | Verified |
-|----------|---------|----------|
-| NativeRollupCore | [`0x4240994d85109581B001183ab965D9e3d5fb2C2A`](https://gnosis.blockscout.com/address/0x4240994d85109581B001183ab965D9e3d5fb2C2A) | Yes |
-| AdminProofVerifier | [`0x92d55056327CBFaF233bbfc3Fc9E8b38cedE4558`](https://gnosis.blockscout.com/address/0x92d55056327CBFaF233bbfc3Fc9E8b38cedE4558) | Yes |
+| Contract | Address | Gnosisscan | Blockscout |
+|----------|---------|------------|------------|
+| NativeRollupCore | `0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d` | [View](https://gnosisscan.io/address/0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d#code) | [View](https://gnosis.blockscout.com/address/0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d) |
+| AdminProofVerifier | `0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C` | [View](https://gnosisscan.io/address/0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C#code) | [View](https://gnosis.blockscout.com/address/0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C) |
+
+**Deployment Details:**
+- Genesis Hash: `0x0000000000000000000000000000000000000000000000000000000000000000` (matches Anvil block 0)
+- Admin/Owner: `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1`
+- Compiler: solc 0.8.27
+- EVM Version: cancun
 
 **Local Testnet (Anvil):**
 
@@ -320,8 +326,6 @@ await l2Signer.sendTransaction({ to: l2Address, data: callData });
 | L2SyncedCounter | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512` |
 
 **Configuration:**
-- Genesis Hash: `0xe491263b13dd2e2c3df6175dbe9057a0f2f7fcf14b63b6ccea6989ac16584ed6`
-- Admin/Owner: `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1`
 - L2 Chain ID: `10200200`
 - L1 RPC: `http://localhost:9545`
 - L2 RPC: `http://localhost:9546`

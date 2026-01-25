@@ -1,6 +1,6 @@
 # Native Rollup L2 Fullnode
 
-The Fullnode deterministically syncs L2 state from L1. It watches L1 events and replays all state transitions on L2, maintaining the invariant:
+The Fullnode deterministically syncs L2 state from L1. It **spawns its own L2 chain** (Anvil) and replays all state transitions by watching L1 events, maintaining the invariant:
 
 ```
 L2 state root == l2BlockHash on L1
@@ -10,9 +10,14 @@ L2 state root == l2BlockHash on L1
 
 **L2 state is a pure function of L1 state.**
 
-The Fullnode doesn't need to trust anyone - it can independently reconstruct the entire L2 state by watching L1 events. This is what makes Native Rollups trustless.
+The Fullnode doesn't need to trust anyone - it spawns a fresh L2 chain and independently reconstructs the entire L2 state by watching L1 events. This is what makes Native Rollups trustless.
 
 ## How It Works
+
+1. **Spawns L2 Anvil** - Creates a fresh EVM chain from scratch
+2. **Watches L1 events** - Subscribes to NativeRollupCore events
+3. **Replays state transitions** - Executes the same operations on L2
+4. **Verifies state** - L2 state root should match L1 commitment
 
 The Fullnode watches two types of L1 events:
 
@@ -43,8 +48,9 @@ Set environment variables or use defaults:
 
 ```bash
 export L1_RPC=http://localhost:9545        # L1 RPC endpoint
-export L2_RPC=http://localhost:9546        # L2 RPC endpoint
 export ROLLUP_ADDRESS=0x...                # NativeRollupCore address
+export L2_PORT=9546                        # Port for spawned L2 Anvil (default: 9546)
+export L2_CHAIN_ID=10200200                # L2 chain ID (default: 10200200)
 ```
 
 ## Running
@@ -54,18 +60,21 @@ npx tsx index.ts
 ```
 
 The fullnode will:
-1. Connect to L1 and L2
-2. Sync all past events
-3. Watch for new events
-4. Keep L2 in sync with L1
+1. Spawn a fresh L2 Anvil instance
+2. Connect to L1
+3. Sync all past events (replaying state on L2)
+4. Watch for new events
+5. Expose L2 RPC at `http://localhost:9546`
 
 ## Output Example
 
 ```
 === Native Rollup L2 Fullnode ===
 L1 RPC: http://localhost:9545
-L2 RPC: http://localhost:9546
 NativeRollupCore: 0xfb2179498F657A1E7dE72cE29221c3a9d483a62b
+
+Spawning L2 Anvil on port 9546...
+L2 Anvil ready at http://localhost:9546
 
 L2 State on L1:
   Block number: 0
@@ -104,6 +113,9 @@ Fullnode running, watching for L1 events...
 │                       Fullnode                               │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
+│  spawnL2Anvil()                                             │
+│    └─▶ Start fresh L2 chain (Anvil)                         │
+│                                                              │
 │  syncPastEvents()                                           │
 │    └─▶ Query all historical events                          │
 │                                                              │
@@ -118,13 +130,15 @@ Fullnode running, watching for L1 events...
 │                                                              │
 └──────────────────────────┬──────────────────────────────────┘
                            │
-                           │ Replay transactions
+                           │ Spawns & controls
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                          L2                                  │
+│                    L2 (Spawned Anvil)                        │
 │                                                              │
 │  State is deterministically reconstructed                   │
 │  from L1 events                                             │
+│                                                              │
+│  RPC exposed at http://localhost:9546                       │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -136,8 +150,9 @@ import { L2Fullnode } from './index';
 
 const fullnode = new L2Fullnode({
   l1Rpc: 'http://localhost:9545',
-  l2Rpc: 'http://localhost:9546',
   rollupAddress: '0x...',
+  l2Port: 9546,
+  l2ChainId: 10200200,
 });
 
 // Set callbacks
@@ -149,19 +164,25 @@ fullnode.onIncomingCall((l2Address, caller) => {
   console.log(`Call to ${l2Address} from ${caller}`);
 });
 
-// Start syncing
+// Start syncing (spawns L2 Anvil automatically)
 await fullnode.start();
+
+// Get the L2 RPC URL for external access
+const l2Rpc = fullnode.getL2Rpc();
+console.log(`L2 available at ${l2Rpc}`);
 
 // Get status
 const status = await fullnode.getStatus();
 console.log(`Synced: ${status.isSynced}`);
 
-// Stop
+// Stop (also kills Anvil)
 fullnode.stop();
 ```
 
 ## Notes
 
+- The fullnode spawns its own L2 Anvil instance - no external L2 endpoint needed
 - Uses Anvil's `anvil_impersonateAccount` for L2 execution (POC only)
 - In production, would use a proper L2 execution client
 - The fullnode can verify state by comparing `l2BlockHash` on L1 with actual L2 state root
+- Multiple fullnodes can run independently and arrive at the same state
