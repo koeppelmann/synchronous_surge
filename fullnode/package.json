@@ -1,0 +1,19 @@
+{
+  "name": "native-rollup-fullnode",
+  "version": "0.1.0",
+  "description": "L2 fullnode for Native Rollup - deterministically syncs L2 state from L1",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "start": "npx tsx index.ts",
+    "dev": "npx tsx watch index.ts"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0",
+    "@types/node": "^20.11.0"
+  }
+}

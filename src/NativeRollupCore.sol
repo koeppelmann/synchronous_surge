@@ -490,6 +490,17 @@ contract NativeRollupCore {
         return size > 0;
     }
 
+    /// @notice Deploy a proxy for an L2 address (permissionless)
+    /// @dev Anyone can deploy a proxy for any L2 address. This is safe because:
+    ///      - The proxy address is deterministic (CREATE2)
+    ///      - The proxy can only execute calls authorized by this contract
+    ///      - Pre-deploying doesn't grant any special permissions
+    /// @param l2Address The L2 contract address
+    /// @return proxy The deployed proxy address
+    function deployProxy(address l2Address) external returns (address proxy) {
+        proxy = _getOrDeployProxy(l2Address);
+    }
+
     /// @notice Get or deploy a proxy for an L2 address
     /// @param l2Address The L2 contract address
     /// @return proxy The proxy address
