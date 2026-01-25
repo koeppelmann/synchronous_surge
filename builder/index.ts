@@ -367,17 +367,23 @@ export class Builder {
 
       // Step 1: Execute on L2 first
       console.log("Step 1: Executing on L2...");
+      if (request.value && request.value > 0n) {
+        console.log(`  Depositing: ${ethers.formatEther(request.value)} ETH`);
+      }
 
       await this.l2Provider.send("anvil_impersonateAccount", [l1CallerProxyOnL2]);
 
-      // Fund the proxy for gas
-      const balance = await this.l2Provider.getBalance(l1CallerProxyOnL2);
-      if (balance < ethers.parseEther("0.1")) {
-        await this.l2Provider.send("anvil_setBalance", [
-          l1CallerProxyOnL2,
-          "0x" + ethers.parseEther("1").toString(16),
-        ]);
-      }
+      // Get current balance and add: deposit value + gas allowance
+      // The deposit value is "minted" deterministically from L1
+      const currentBalance = await this.l2Provider.getBalance(l1CallerProxyOnL2);
+      const depositValue = request.value || 0n;
+      const gasAllowance = ethers.parseEther("0.1");
+      const newBalance = currentBalance + depositValue + gasAllowance;
+
+      await this.l2Provider.send("anvil_setBalance", [
+        l1CallerProxyOnL2,
+        "0x" + newBalance.toString(16),
+      ]);
 
       const l2Signer = await this.l2Provider.getSigner(l1CallerProxyOnL2);
       const l2Tx = await l2Signer.sendTransaction({
@@ -742,6 +748,35 @@ async function main() {
       break;
     }
 
+    case "deposit": {
+      // Deposit xDAI to an L2 EOA
+      const l1Caller = args[1]; // Any L1 address (will be impersonated)
+      const l2Recipient = args[2]; // EOA to receive funds on L2
+      const amount = args[3]; // Amount in wei
+
+      if (!l1Caller || !l2Recipient || !amount) {
+        console.log(
+          "Usage: npx tsx builder/index.ts deposit <l1Caller> <l2Recipient> <amountWei>"
+        );
+        console.log(
+          "\nExample: npx tsx builder/index.ts deposit 0xf39F... 0x7B2e... 1000000000000000000"
+        );
+        process.exit(1);
+      }
+
+      console.log(`Depositing ${ethers.formatEther(amount)} xDAI to ${l2Recipient}`);
+
+      const result = await builder.executeL1ToL2Call(
+        l1Caller,
+        l2Recipient,
+        "0x", // No calldata - just value transfer to EOA
+        BigInt(amount)
+      );
+
+      console.log("\nResult:", result);
+      break;
+    }
+
     case "status": {
       const l2State = await builder.getL2State();
       const l2StateRoot = await builder.getL2StateRoot();
@@ -762,12 +797,16 @@ async function main() {
       console.log("Commands:");
       console.log("  l2-tx <from> <to> [value] [data]      - Build L2 EOA transaction");
       console.log("  l1-to-l2 <l1Caller> <l2Target> [data] - Execute L1→L2 call");
+      console.log("  deposit <l1Caller> <l2Recipient> <wei> - Deposit xDAI to L2 EOA");
       console.log("  prepare <l1Caller> <l2Target> [data]  - Prepare incoming call only");
       console.log("  status                                - Show current state");
       console.log("");
       console.log("Examples:");
       console.log(
         "  npx tsx builder/index.ts l2-tx 0xf39F... 0x7B2e... 1000000000000000000"
+      );
+      console.log(
+        "  npx tsx builder/index.ts deposit 0xf39F... 0x7B2e... 1000000000000000000"
       );
       console.log(
         "  npx tsx builder/index.ts l1-to-l2 0xd30b... 0xe7f1... 0x55241077..."

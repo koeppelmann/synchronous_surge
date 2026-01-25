@@ -33,15 +33,19 @@ contract L2SenderProxy {
         (success, result) = target.call{value: msg.value}(data);
     }
 
-    /// @notice Allow receiving ETH
-    receive() external payable {}
+    /// @notice Handle ETH transfers (no calldata)
+    /// @dev Also forwards to handleIncomingCall to properly track deposits
+    receive() external payable {
+        // Forward the ETH transfer to NativeRollupCore
+        INativeRollupCore(nativeRollup).handleIncomingCall{value: msg.value}(l2Address, "");
+    }
 
     /// @notice Handle incoming calls to this L2 address
-    /// @dev Forwards the call to NativeRollupCore.handleIncomingCall()
+    /// @dev Forwards the call (and value) to NativeRollupCore.handleIncomingCall()
     /// @return The pre-registered return value
     fallback(bytes calldata) external payable returns (bytes memory) {
-        // Forward the incoming call to NativeRollupCore
-        return INativeRollupCore(nativeRollup).handleIncomingCall(l2Address, msg.data);
+        // Forward the incoming call and value to NativeRollupCore
+        return INativeRollupCore(nativeRollup).handleIncomingCall{value: msg.value}(l2Address, msg.data);
     }
 }
 
@@ -50,5 +54,5 @@ interface INativeRollupCore {
     function handleIncomingCall(
         address l2Address,
         bytes calldata callData
-    ) external returns (bytes memory);
+    ) external payable returns (bytes memory);
 }

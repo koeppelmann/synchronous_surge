@@ -54,7 +54,7 @@ const ROLLUP_ABI = [
   "event OutgoingCallExecuted(uint256 indexed blockNumber, uint256 indexed callIndex, address indexed from, address target, bool success)",
   "event L2SenderProxyDeployed(address indexed l2Address, address indexed proxyAddress)",
   "event IncomingCallRegistered(address indexed l2Address, bytes32 indexed stateHash, bytes32 indexed callDataHash, bytes32 responseKey)",
-  "event IncomingCallHandled(address indexed l2Address, bytes32 indexed responseKey, uint256 outgoingCallsCount)",
+  "event IncomingCallHandled(address indexed l2Address, bytes32 indexed responseKey, uint256 outgoingCallsCount, uint256 value)",
 
   // View functions
   "function l2BlockHash() view returns (bytes32)",
@@ -222,6 +222,7 @@ export class L2Fullnode {
         l2Address: string,
         responseKey: string,
         outgoingCallsCount: bigint,
+        value: bigint,
         event: any
       ) => {
         await this.handleIncomingCallHandled(event);
@@ -279,6 +280,7 @@ export class L2Fullnode {
   private async handleIncomingCallHandled(event: any): Promise<void> {
     const l2Address = event.args[0];
     const responseKey = event.args[1];
+    const value = BigInt(event.args[3] || 0); // value is the 4th argument
 
     if (this.processedIncomingCalls.has(responseKey)) {
       return; // Already processed
@@ -287,6 +289,9 @@ export class L2Fullnode {
     this.processedIncomingCalls.add(responseKey);
 
     console.log(`Processing incoming call to ${l2Address}...`);
+    if (value > 0n) {
+      console.log(`  Value: ${ethers.formatEther(value)} ETH`);
+    }
 
     try {
       // Get the L1 transaction
@@ -315,8 +320,8 @@ export class L2Fullnode {
       console.log(`  L1 Caller: ${l1Caller}`);
       console.log(`  L2 Target: ${l2Address}`);
 
-      // Execute the call on L2
-      await this.executeL1ToL2Call(l1Caller, l2Address, 0n, callData);
+      // Execute the call on L2 with the value
+      await this.executeL1ToL2Call(l1Caller, l2Address, value, callData);
 
       console.log(`  ✓ Incoming call processed`);
 
@@ -435,6 +440,11 @@ export class L2Fullnode {
 
   /**
    * Execute an L1→L2 call by impersonating the L1 caller's proxy on L2
+   *
+   * For deposits (value > 0), the value is "minted" on L2 by adding it to the
+   * proxy's balance. This is deterministic because:
+   * - The value comes from the L1 event
+   * - The proxy address is deterministic
    */
   private async executeL1ToL2Call(
     l1Caller: string,
@@ -449,16 +459,20 @@ export class L2Fullnode {
     // Impersonate the proxy on L2
     await this.l2Provider.send("anvil_impersonateAccount", [l2ProxyOfL1Caller]);
 
-    // Ensure sufficient balance for gas
-    const balance = await this.l2Provider.getBalance(l2ProxyOfL1Caller);
-    if (balance < ethers.parseEther("0.1")) {
-      await this.l2Provider.send("anvil_setBalance", [
-        l2ProxyOfL1Caller,
-        "0x" + ethers.parseEther("1").toString(16),
-      ]);
-    }
+    // Get current balance
+    const currentBalance = await this.l2Provider.getBalance(l2ProxyOfL1Caller);
 
-    // Execute the call
+    // Add value (deposit) + gas allowance to the balance
+    // The deposited value is "minted" deterministically from L1 event
+    const gasAllowance = ethers.parseEther("0.1");
+    const newBalance = currentBalance + value + gasAllowance;
+
+    await this.l2Provider.send("anvil_setBalance", [
+      l2ProxyOfL1Caller,
+      "0x" + newBalance.toString(16),
+    ]);
+
+    // Execute the call (transfers value to l2Target)
     const signer = await this.l2Provider.getSigner(l2ProxyOfL1Caller);
     const tx = await signer.sendTransaction({
       to: l2Target,

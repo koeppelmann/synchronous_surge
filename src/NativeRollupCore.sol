@@ -110,7 +110,8 @@ contract NativeRollupCore {
     event IncomingCallHandled(
         address indexed l2Address,
         bytes32 indexed responseKey,
-        uint256 outgoingCallsCount
+        uint256 outgoingCallsCount,
+        uint256 value
     );
 
     error InvalidPrevBlockHash(bytes32 expected, bytes32 provided);
@@ -294,7 +295,7 @@ contract NativeRollupCore {
     function handleIncomingCall(
         address l2Address,
         bytes calldata callData
-    ) external returns (bytes memory returnData) {
+    ) external payable returns (bytes memory returnData) {
         // Only callable by the proxy for this L2 address
         address expectedProxy = getProxyAddress(l2Address);
         if (msg.sender != expectedProxy) {
@@ -357,7 +358,7 @@ contract NativeRollupCore {
             revert UnexpectedFinalState(response.finalStateHash, l2BlockHash);
         }
 
-        emit IncomingCallHandled(l2Address, responseKey, response.outgoingCalls.length);
+        emit IncomingCallHandled(l2Address, responseKey, response.outgoingCalls.length, msg.value);
 
         return response.returnValue;
     }
