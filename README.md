@@ -2,6 +2,50 @@
 
 A minimal implementation of **Native Rollups** - L2s where state is a pure function of L1 state, proven and verified atomically with block submission.
 
+## Quick Start
+
+Start the complete Native Rollup environment with a single command:
+
+```bash
+cd synchronous_surge
+./start.sh
+```
+
+This starts:
+- **L1 Anvil** (port 8545) - Local Ethereum chain
+- **L2 Fullnode** (port 9546) - Deterministic L2 derived from L1
+- **Builder** (port 3200) - Processes L1→L2 deposits
+- **L1 RPC Proxy** (port 8546) - Routes wallet transactions through builder
+- **L2 RPC Proxy** (port 9548) - Routes L2 transactions through builder
+- **Frontend** (port 8080) - Web UI for deposits/withdrawals
+
+### Wallet Setup
+
+Add these networks to your wallet (e.g., MetaMask, Rabby):
+
+| Network | Chain ID | RPC URL |
+|---------|----------|---------|
+| L1 (via proxy) | 31337 | `http://localhost:8546` |
+| L2 (via proxy) | 10200200 | `http://localhost:9548` |
+
+**Important:** Use the proxy ports (8546/9548), not the direct RPC ports, so transactions are routed through the builder.
+
+### Test the Flow
+
+1. Open http://localhost:8080 in your browser
+2. Connect your wallet to L1 (Chain ID 31337, port 8546)
+3. The default Anvil account has 10,000 ETH
+4. Enter an amount and click "Deposit to L2"
+5. Switch your wallet to L2 (Chain ID 10200200, port 9548)
+6. Your deposited ETH appears on L2
+
+### Stop Everything
+
+```bash
+./stop.sh
+# or just Ctrl+C in the terminal running start.sh
+```
+
 ## Overview
 
 Native Rollups eliminate the 7-day withdrawal delays of optimistic rollups by proving each L2 state transition at submission time. This enables **instant L2→L1 bridging** and **synchronous cross-chain composability**.
@@ -127,10 +171,12 @@ npx tsx index.ts status
 
 | Script | Description |
 |--------|-------------|
-| `fullnode/index.ts` | L2 Fullnode - syncs L2 deterministically from L1 |
-| `builder/index.ts` | Builder - creates L2 txs and L1→L2 calls |
-| `scripts/l1-to-l2-executor.ts` | Execute L1→L2 calls via L1SyncedCounter with real state roots |
-| `scripts/direct-proxy-call.ts` | Execute direct L2 proxy calls from any L1 address |
+| `start.sh` | **Start everything** - L1, contracts, fullnode, builder, proxies, UI |
+| `stop.sh` | Stop all running components |
+| `fullnode/deterministic-fullnode.ts` | L2 Fullnode - derives state from L1 events |
+| `scripts/deterministic-builder.ts` | Builder - handles L1→L2 deposits and L2 transactions |
+| `scripts/rpc-proxy.ts` | L1 RPC proxy - routes transactions through builder |
+| `scripts/l2-rpc-proxy.ts` | L2 RPC proxy - routes L2 transactions through builder |
 
 ## Usage
 
@@ -146,17 +192,46 @@ forge build
 forge test
 ```
 
-### Run Dual-Chain Environment
+### Run Full Stack (Recommended)
 
 ```bash
-# Terminal 1: Start L1 (Gnosis fork)
-anvil --fork-url https://rpc.gnosischain.com --port 9545
+./start.sh
+```
 
-# Terminal 2: Start L2 (fresh chain)
-anvil --chain-id 10200200 --port 9546
+This script:
+1. Calculates the deterministic genesis hash
+2. Starts L1 Anvil (auto-mine mode)
+3. Deploys NativeRollupCore with correct genesis
+4. Starts the deterministic fullnode
+5. Starts the builder service
+6. Starts RPC proxies for wallet integration
+7. Starts the frontend UI
 
-# Terminal 3: Run sequencer
-cd sequencer && npx tsx index.ts
+### Run Components Manually
+
+If you prefer to run components separately:
+
+```bash
+# Terminal 1: Start L1
+anvil --port 8545 --chain-id 31337
+
+# Terminal 2: Start L2 Fullnode (after deploying contracts)
+npx tsx fullnode/deterministic-fullnode.ts \
+    --l1-rpc http://localhost:8545 \
+    --rollup <ROLLUP_ADDRESS> \
+    --port 9546
+
+# Terminal 3: Start Builder
+npx tsx scripts/deterministic-builder.ts \
+    --l1-rpc http://localhost:8545 \
+    --fullnode http://localhost:9546 \
+    --rollup <ROLLUP_ADDRESS> \
+    --admin-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+    --port 3200
+
+# Terminal 4: Start RPC Proxies
+npx tsx scripts/rpc-proxy.ts --rpc http://localhost:8545 --builder http://localhost:3200 --port 8546
+npx tsx scripts/l2-rpc-proxy.ts --rpc http://localhost:9546 --builder http://localhost:3200 --port 9548
 ```
 
 ### Deploy
@@ -318,17 +393,25 @@ await l2Signer.sendTransaction({ to: l2Address, data: callData });
 - Compiler: solc 0.8.27
 - EVM Version: cancun
 
-**Local Testnet (Anvil):**
+**Local Testnet (via start.sh):**
 
-| Contract | Address |
-|----------|---------|
-| L1SyncedCounter | `0xd30bF3219A0416602bE8D482E0396eF332b0494E` |
-| L2SyncedCounter | `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512` |
+Contracts are deployed fresh each time. The NativeRollupCore address is printed in the startup output.
+
+**Service Ports:**
+
+| Service | Port | Description |
+|---------|------|-------------|
+| L1 RPC (direct) | 8545 | Direct Anvil access |
+| L1 RPC (proxy) | 8546 | **Use this in wallet** - routes through builder |
+| L2 RPC (direct) | 9546 | Direct fullnode access |
+| L2 RPC (proxy) | 9548 | **Use this in wallet** - routes through builder |
+| Builder API | 3200 | Builder status and transaction submission |
+| Frontend | 8080 | Web UI for deposits/withdrawals |
 
 **Configuration:**
+- L1 Chain ID: `31337`
 - L2 Chain ID: `10200200`
-- L1 RPC: `http://localhost:9545`
-- L2 RPC: `http://localhost:9546`
+- L2 System Address: `0x1000000000000000000000000000000000000001` (10B ETH at genesis)
 
 ## Test Accounts
 
