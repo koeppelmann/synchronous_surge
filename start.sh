@@ -3,11 +3,15 @@
 # Native Rollup - Complete Setup Script
 #
 # This script starts all components needed for the Native Rollup POC:
-# 1. L1 Anvil (fresh chain)
-# 2. Deploy NativeRollupCore with correct genesis hash
-# 3. Deterministic Fullnode
-# 4. Deterministic Builder
-# 5. Frontend server
+# 1. L1 Anvil (loads pre-deployed state with contracts + SyncedCounter)
+# 2. Deterministic Fullnode (syncs from L1 events)
+# 3. Deterministic Builder
+# 4. Frontend server
+#
+# The L1 state includes:
+# - NativeRollupCore with all infrastructure
+# - L1SyncedCounter and L2SyncedCounter deployed
+# - 1 ETH deposited to deployer on L2
 #
 
 set -e
@@ -28,13 +32,19 @@ L2_PORT=9546
 BUILDER_PORT=3200
 FRONTEND_PORT=8080
 
-# Addresses
+# Pre-deployed contract addresses (from saved state)
+ROLLUP_ADDRESS="0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+VERIFIER_ADDRESS="0x5FbDB2315678afecb367f032d93F642f64180aa3"
+L1_SYNCED_COUNTER="0x2E983A1Ba5e8b38AAAeC4B440B9dDcFBf72E15d1"
+L2_SYNCED_COUNTER="0x663F3ad617193148711d28f5334eE4Ed07016602"
+L1_PROXY_ON_L2="0xc7b2ddde61c78714fbc7678e6f8236f517f0c16c"
+
+# Keys
 ADMIN_PRIVATE_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 ADMIN_ADDRESS="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
-# L2 System address (for genesis)
-L2_SYSTEM_ADDRESS="0x1000000000000000000000000000000000000001"
-L2_SYSTEM_BALANCE="0x204fce5e3e25026110000000" # 10 billion ETH in hex
+# State file
+L1_STATE_FILE="state/l1-state.json"
 
 log() {
     echo -e "${BLUE}[$(date +%H:%M:%S)]${NC} $1"
@@ -81,83 +91,43 @@ wait_for_rpc() {
     return 1
 }
 
-calculate_genesis_hash() {
-    log "Calculating deterministic genesis hash..."
+start_l1_with_state() {
+    if [ ! -f "$L1_STATE_FILE" ]; then
+        error "L1 state file not found: $L1_STATE_FILE"
+        error "Run './setup-fresh.sh' first to create initial state"
+        exit 1
+    fi
 
-    # Start temporary anvil to calculate genesis
-    anvil --port 19999 --chain-id 10200200 --accounts 0 --silent &
-    local temp_pid=$!
-    sleep 2
-
-    # Fund system address
-    curl -s http://localhost:19999 -X POST -H "Content-Type: application/json" \
-        -d "{\"jsonrpc\":\"2.0\",\"method\":\"anvil_setBalance\",\"params\":[\"$L2_SYSTEM_ADDRESS\", \"$L2_SYSTEM_BALANCE\"],\"id\":1}" > /dev/null
-
-    # Mine a block
-    curl -s http://localhost:19999 -X POST -H "Content-Type: application/json" \
-        -d '{"jsonrpc":"2.0","method":"evm_mine","params":[],"id":1}' > /dev/null
-
-    # Get state root
-    GENESIS_HASH=$(curl -s http://localhost:19999 -X POST -H "Content-Type: application/json" \
-        -d '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest", false],"id":1}' \
-        | python3 -c "import sys, json; print(json.loads(sys.stdin.read())['result']['stateRoot'])")
-
-    kill $temp_pid 2>/dev/null || true
-    wait $temp_pid 2>/dev/null || true
-
-    success "Genesis hash: $GENESIS_HASH"
-}
-
-start_l1() {
-    log "Starting L1 Anvil on port $L1_PORT..."
-    # No --block-time means blocks are mined only when transactions are pending
+    log "Starting L1 Anvil..."
     anvil --port $L1_PORT --chain-id 31337 --silent &
 
-    if wait_for_rpc "http://localhost:$L1_PORT" "L1 Anvil"; then
-        success "L1 Anvil started (auto-mine mode)"
-    else
+    if ! wait_for_rpc "http://localhost:$L1_PORT" "L1 Anvil"; then
         error "Failed to start L1 Anvil"
         exit 1
     fi
-}
 
-deploy_contracts() {
-    log "Deploying NativeRollupCore..."
+    # Load the saved state via RPC
+    log "Loading pre-deployed state..."
+    local state=$(cat "$L1_STATE_FILE")
+    local result=$(curl -s -X POST http://localhost:$L1_PORT \
+        -H "Content-Type: application/json" \
+        -d "{\"jsonrpc\":\"2.0\",\"method\":\"anvil_loadState\",\"params\":[\"$state\"],\"id\":1}")
 
-    # Compile contracts if needed
-    if [ ! -d "out" ]; then
-        log "Compiling contracts..."
-        forge build
-    fi
-
-    # Deploy using forge script
-    DEPLOY_OUTPUT=$(GENESIS_HASH=$GENESIS_HASH ADMIN=$ADMIN_ADDRESS forge script script/Deploy.s.sol:DeployScript \
-        --rpc-url http://localhost:$L1_PORT \
-        --private-key $ADMIN_PRIVATE_KEY \
-        --broadcast 2>&1)
-
-    # Extract addresses from output
-    VERIFIER_ADDRESS=$(echo "$DEPLOY_OUTPUT" | grep "AdminProofVerifier:" | awk '{print $2}')
-    ROLLUP_ADDRESS=$(echo "$DEPLOY_OUTPUT" | grep "NativeRollupCore:" | awk '{print $2}')
-
-    if [ -z "$ROLLUP_ADDRESS" ]; then
-        error "Failed to deploy contracts"
-        echo "$DEPLOY_OUTPUT"
+    if echo "$result" | grep -q '"result":true'; then
+        success "L1 state loaded successfully"
+    else
+        error "Failed to load L1 state: $result"
         exit 1
     fi
 
-    success "AdminProofVerifier deployed at: $VERIFIER_ADDRESS"
-    success "NativeRollupCore deployed at: $ROLLUP_ADDRESS"
-
-    # Verify the genesis hash was set correctly
-    STORED_HASH=$(cast call $ROLLUP_ADDRESS "l2BlockHash()(bytes32)" --rpc-url http://localhost:$L1_PORT)
-    if [ "$STORED_HASH" = "$GENESIS_HASH" ]; then
-        success "Genesis hash verified in contract"
-    else
-        warn "Genesis hash mismatch! Expected: $GENESIS_HASH, Got: $STORED_HASH"
+    # Verify contracts are deployed
+    local code=$(cast code $ROLLUP_ADDRESS --rpc-url http://localhost:$L1_PORT 2>/dev/null || echo "0x")
+    if [ "$code" = "0x" ]; then
+        error "NativeRollupCore not found at $ROLLUP_ADDRESS"
+        error "State file may be corrupted. Run './setup-fresh.sh' to recreate"
+        exit 1
     fi
-
-    export ROLLUP_ADDRESS
+    success "Verified NativeRollupCore at $ROLLUP_ADDRESS"
 }
 
 start_fullnode() {
@@ -236,6 +206,11 @@ start_frontend() {
 }
 
 print_summary() {
+    # Get current L2 state
+    local L2_BLOCK=$(curl -s http://localhost:$L2_PORT -X POST -H "Content-Type: application/json" \
+        -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null \
+        | python3 -c "import sys, json; print(int(json.loads(sys.stdin.read())['result'], 16))" 2>/dev/null || echo "?")
+
     echo ""
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN}   Native Rollup POC - Ready!${NC}"
@@ -248,8 +223,13 @@ print_summary() {
     echo -e "  ${BLUE}Builder API:${NC}      http://localhost:$BUILDER_PORT"
     echo -e "  ${BLUE}Frontend:${NC}         http://localhost:$FRONTEND_PORT"
     echo ""
-    echo -e "  ${BLUE}NativeRollupCore:${NC} $ROLLUP_ADDRESS"
-    echo -e "  ${BLUE}Genesis Hash:${NC}     $GENESIS_HASH"
+    echo -e "  ${BLUE}Contracts:${NC}"
+    echo -e "    NativeRollupCore:  $ROLLUP_ADDRESS"
+    echo -e "    L1SyncedCounter:   $L1_SYNCED_COUNTER"
+    echo -e "    L2SyncedCounter:   $L2_SYNCED_COUNTER"
+    echo ""
+    echo -e "  ${BLUE}L2 Status:${NC}"
+    echo -e "    Block Number: $L2_BLOCK"
     echo ""
     echo -e "  ${YELLOW}Logs:${NC}"
     echo "    - Fullnode:  logs/fullnode.log"
@@ -274,7 +254,7 @@ verify_sync() {
         | python3 -c "import sys, json; print(json.loads(sys.stdin.read())['result']['stateRoot'])")
 
     if [ "$L1_STATE" = "$L2_STATE" ]; then
-        success "L1 and L2 state roots MATCH: $L1_STATE"
+        success "L1 and L2 state roots MATCH: ${L1_STATE:0:18}..."
     else
         warn "State root mismatch:"
         echo "  L1 expects: $L1_STATE"
@@ -295,16 +275,10 @@ main() {
     # Cleanup any existing processes
     cleanup
 
-    # Calculate genesis hash first
-    calculate_genesis_hash
+    # Start L1 with pre-deployed state
+    start_l1_with_state
 
-    # Start L1
-    start_l1
-
-    # Deploy contracts
-    deploy_contracts
-
-    # Start fullnode
+    # Start fullnode (will sync from L1 events)
     start_fullnode
 
     # Start builder

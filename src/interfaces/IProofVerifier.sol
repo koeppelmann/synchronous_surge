@@ -14,12 +14,12 @@ struct OutgoingCall {
 
 /// @notice Interface for proof verification
 /// @dev Proof must cover entire state transition chain:
-///      prevBlockHash → postExecutionStateHash → call[0].postCallStateHash → ... → finalStateHash
+///      prevBlockHash → preOutgoingCallsStateHash → call[0].postCallStateHash → ... → finalStateHash
 interface IProofVerifier {
     function verifyProof(
         bytes32 prevBlockHash,
-        bytes calldata callData,
-        bytes32 postExecutionStateHash,
+        bytes calldata rlpEncodedTx,
+        bytes32 preOutgoingCallsStateHash,
         OutgoingCall[] calldata outgoingCalls,
         bytes[] calldata expectedResults,
         bytes32 finalStateHash,

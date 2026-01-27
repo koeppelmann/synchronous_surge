@@ -69,11 +69,14 @@ contract NativeRollupCore {
     }
 
     /// @notice Emitted when L2 state transitions
+    /// @dev Contains ALL data needed for fullnode to reconstruct L2 state
     event L2BlockProcessed(
         uint256 indexed blockNumber,
         bytes32 indexed prevBlockHash,
         bytes32 indexed newBlockHash,
-        uint256 outgoingCallsCount
+        bytes rlpEncodedTx,              // The RLP-encoded signed L2 transaction
+        OutgoingCall[] outgoingCalls,    // L2→L1 calls made during execution
+        bytes[] outgoingCallResults      // Results returned by L1 calls
     );
 
     /// @notice Emitted when L2 state is updated (includes intermediate states)
@@ -106,12 +109,17 @@ contract NativeRollupCore {
         bytes32 responseKey
     );
 
-    /// @notice Emitted when an incoming call is handled
+    /// @notice Emitted when an incoming call is handled (L1→L2 call)
+    /// @dev Contains ALL data needed for fullnode to reconstruct L2 state
     event IncomingCallHandled(
         address indexed l2Address,
-        bytes32 indexed responseKey,
-        uint256 outgoingCallsCount,
-        uint256 value
+        address indexed l1Caller,
+        bytes32 indexed prevBlockHash,
+        bytes callData,                  // The calldata that was sent to the L2 contract
+        uint256 value,                   // ETH value sent
+        OutgoingCall[] outgoingCalls,    // L2→L1 calls made during execution
+        bytes[] outgoingCallResults,     // Results returned by L1 calls
+        bytes32 finalStateHash           // Final L2 state after all calls
     );
 
     error InvalidPrevBlockHash(bytes32 expected, bytes32 provided);
@@ -151,19 +159,19 @@ contract NativeRollupCore {
         owner = _owner;
     }
 
-    /// @notice Process a call on L2 and execute resulting L1 calls
+    /// @notice Process a single L2 transaction and execute resulting L1 calls
     /// @dev State is committed BEFORE each L1 call for synchronous composability
     /// @param prevL2BlockHash The L2 block hash before this transition
-    /// @param callData The input data that was "called" on L2
-    /// @param postExecutionStateHash The L2 state hash after L2 execution, BEFORE any L1 calls
+    /// @param rlpEncodedTx The RLP-encoded signed L2 transaction
+    /// @param preOutgoingCallsStateHash The L2 state hash after L2 execution, BEFORE any L1 calls
     /// @param outgoingCalls Array of L1 calls, each with its expected post-call state hash
     /// @param expectedResults Expected return data for each outgoing call
     /// @param finalStateHash The final L2 state hash after all outgoing calls complete
     /// @param proof Proof of valid L2 state transition chain
-    function processCallOnL2(
+    function processSingleTxOnL2(
         bytes32 prevL2BlockHash,
-        bytes calldata callData,
-        bytes32 postExecutionStateHash,
+        bytes calldata rlpEncodedTx,
+        bytes32 preOutgoingCallsStateHash,
         OutgoingCall[] calldata outgoingCalls,
         bytes[] calldata expectedResults,
         bytes32 finalStateHash,
@@ -177,8 +185,8 @@ contract NativeRollupCore {
         // Verify the proof covers the entire state transition chain
         if (!proofVerifier.verifyProof(
             prevL2BlockHash,
-            callData,
-            postExecutionStateHash,
+            rlpEncodedTx,
+            preOutgoingCallsStateHash,
             outgoingCalls,
             expectedResults,
             finalStateHash,
@@ -191,10 +199,13 @@ contract NativeRollupCore {
         l2BlockNumber++;
         bytes32 prevHash = l2BlockHash;
 
-        // Commit post-execution state BEFORE any L1 calls
+        // Commit pre-outgoing-calls state BEFORE any L1 calls
         // This ensures L1 contracts see the L2 state that includes this block's execution
-        l2BlockHash = postExecutionStateHash;
-        emit L2StateUpdated(l2BlockNumber, postExecutionStateHash, 0);
+        l2BlockHash = preOutgoingCallsStateHash;
+        emit L2StateUpdated(l2BlockNumber, preOutgoingCallsStateHash, 0);
+
+        // Collect actual results from outgoing calls
+        bytes[] memory actualResults = new bytes[](outgoingCalls.length);
 
         // Execute outgoing L1 calls through L2SenderProxy contracts
         for (uint256 i = 0; i < outgoingCalls.length; i++) {
@@ -214,6 +225,9 @@ contract NativeRollupCore {
             if (!success) {
                 revert OutgoingCallFailed(i, c.from, c.target);
             }
+
+            // Store actual result for event emission
+            actualResults[i] = result;
 
             // Verify the return data matches expectation
             bytes32 actualResultHash = keccak256(result);
@@ -241,8 +255,8 @@ contract NativeRollupCore {
             revert UnexpectedFinalState(finalStateHash, l2BlockHash);
         }
 
-        // Emit the final block processed event
-        emit L2BlockProcessed(l2BlockNumber, prevHash, l2BlockHash, outgoingCalls.length);
+        // Emit the final block processed event with all data for fullnode reconstruction
+        emit L2BlockProcessed(l2BlockNumber, prevHash, l2BlockHash, rlpEncodedTx, outgoingCalls, actualResults);
     }
 
     /// @notice Register an incoming call response
@@ -294,6 +308,7 @@ contract NativeRollupCore {
     /// @return returnData The pre-registered return value
     function handleIncomingCall(
         address l2Address,
+        address l1Caller,
         bytes calldata callData
     ) external payable returns (bytes memory returnData) {
         // Only callable by the proxy for this L2 address
@@ -301,6 +316,9 @@ contract NativeRollupCore {
         if (msg.sender != expectedProxy) {
             revert OnlyProxy();
         }
+
+        // Store prevBlockHash for event emission
+        bytes32 prevBlockHash = l2BlockHash;
 
         bytes32 responseKey = _getResponseKey(l2Address, l2BlockHash, callData);
 
@@ -317,6 +335,9 @@ contract NativeRollupCore {
         if (l2BlockHash != response.preOutgoingCallsStateHash) {
             revert UnexpectedPreOutgoingState(response.preOutgoingCallsStateHash, l2BlockHash);
         }
+
+        // Collect actual results from outgoing calls
+        bytes[] memory actualResults = new bytes[](response.outgoingCalls.length);
 
         // Execute outgoing calls (these may recursively call back)
         for (uint256 i = 0; i < response.outgoingCalls.length; i++) {
@@ -336,6 +357,9 @@ contract NativeRollupCore {
             if (!success) {
                 revert OutgoingCallFailed(i, c.from, c.target);
             }
+
+            // Store actual result for event emission
+            actualResults[i] = result;
 
             // Verify the return data matches expectation
             bytes32 actualResultHash = keccak256(result);
@@ -358,7 +382,17 @@ contract NativeRollupCore {
             revert UnexpectedFinalState(response.finalStateHash, l2BlockHash);
         }
 
-        emit IncomingCallHandled(l2Address, responseKey, response.outgoingCalls.length, msg.value);
+        // Emit event with ALL data needed for fullnode reconstruction
+        emit IncomingCallHandled(
+            l2Address,
+            l1Caller,
+            prevBlockHash,
+            callData,
+            msg.value,
+            response.outgoingCalls,
+            actualResults,
+            response.finalStateHash
+        );
 
         return response.returnValue;
     }

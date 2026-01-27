@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Native Rollup Dashboard</title>
+  <title>Synchronous Rollup Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/ethers@6.9.0/dist/ethers.umd.min.js"></script>
   <style>
     * {
@@ -383,7 +383,7 @@
   </style>
 </head>
 <body>
-  <h1>Native Rollup Dashboard</h1>
+  <h1>Synchronous Rollup Dashboard</h1>
 
   <!-- Status Dashboard Card -->
   <div class="card">
@@ -429,6 +429,48 @@
           <span class="status-value" id="stateMatch">-</span>
         </div>
       </div>
+    </div>
+
+    <!-- SyncedCounter Status -->
+    <div class="dashboard-grid" style="margin-top: 20px;">
+      <!-- L1 SyncedCounter -->
+      <div class="chain-status">
+        <h3>L1 SyncedCounter</h3>
+        <div class="status-row">
+          <span class="status-label">Address</span>
+          <span class="status-value hash copyable" id="l1CounterAddress" title="0x2E983A1Ba5e8b38AAAeC4B440B9dDcFBf72E15d1" onclick="copyToClipboard(this)">0x2E98...5d1</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Value</span>
+          <span class="status-value" id="l1CounterValue">-</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">L2 Contract Proxy</span>
+          <span class="status-value hash copyable" id="l1CounterL2Proxy" title="" onclick="copyToClipboard(this)">-</span>
+        </div>
+      </div>
+
+      <!-- L2 SyncedCounter -->
+      <div class="chain-status l2">
+        <h3>L2 SyncedCounter</h3>
+        <div class="status-row">
+          <span class="status-label">Address</span>
+          <span class="status-value hash copyable" id="l2CounterAddress" title="0x663F3ad617193148711d28f5334eE4Ed07016602" onclick="copyToClipboard(this)">0x663F...602</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Value</span>
+          <span class="status-value" id="l2CounterValue">-</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">L1 Contract Proxy</span>
+          <span class="status-value hash copyable" id="l2CounterL1Proxy" title="" onclick="copyToClipboard(this)">-</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="status-row" style="margin-top: 10px; padding: 10px; background: #f8f9fa; border-radius: 4px;">
+      <span class="status-label">Counter Sync Status</span>
+      <span class="status-value" id="counterSyncStatus">-</span>
     </div>
 
     <!-- Account Balances -->
@@ -542,7 +584,7 @@
       <div id="abiTab" class="hidden">
         <div class="form-group">
           <label>Function Signature</label>
-          <input type="text" id="functionSig" placeholder="transfer(address,uint256)" />
+          <input type="text" id="functionSig" placeholder="transfer(address,uint256)" value="setValue(uint256)" />
         </div>
         <div class="form-group">
           <label>Parameters (comma separated)</label>
@@ -601,6 +643,15 @@
       "function getProxyAddress(address l2Address) view returns (address)",
       "function isProxyDeployed(address l2Address) view returns (bool)",
     ];
+
+    const SYNCED_COUNTER_ABI = [
+      "function value() view returns (uint256)",
+      "function l1ContractProxy() view returns (address)",
+    ];
+
+    // SyncedCounter addresses from start.sh
+    const L1_SYNCED_COUNTER = '0x2E983A1Ba5e8b38AAAeC4B440B9dDcFBf72E15d1';
+    const L2_SYNCED_COUNTER = '0x663F3ad617193148711d28f5334eE4Ed07016602';
 
     // ============ Network Configuration ============
     const NETWORKS = {
@@ -715,6 +766,9 @@
         // Update balances
         await updateBalancesTable(l1Provider, l2Provider);
 
+        // Update SyncedCounter info
+        await updateSyncedCounterInfo(l1Provider, l2Provider, rollup);
+
         indicator.textContent = `Updated ${new Date().toLocaleTimeString()}`;
         indicator.className = 'refresh-indicator';
 
@@ -754,6 +808,74 @@
 
       } catch (err) {
         tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: #dc3545;">Error: ${err.message}</td></tr>`;
+      }
+    }
+
+    // ============ SyncedCounter Info ============
+    async function updateSyncedCounterInfo(l1Provider, l2Provider, rollup) {
+      try {
+        const l1Counter = new ethers.Contract(L1_SYNCED_COUNTER, SYNCED_COUNTER_ABI, l1Provider);
+        const l2Counter = new ethers.Contract(L2_SYNCED_COUNTER, SYNCED_COUNTER_ABI, l2Provider);
+
+        // Fetch counter values and proxy addresses in parallel
+        const [l1Value, l2Value, l1ProxyOnL2] = await Promise.all([
+          l1Counter.value().catch(() => null),
+          l2Counter.value().catch(() => null),
+          rollup.getProxyAddress(L1_SYNCED_COUNTER).catch(() => null),
+        ]);
+
+        // Try to get L2's l1ContractProxy setting
+        let l2ProxyOnL1 = null;
+        try {
+          l2ProxyOnL1 = await l2Counter.l1ContractProxy();
+        } catch (e) {
+          // Contract might not have this function
+        }
+
+        // Update L1 Counter display
+        document.getElementById('l1CounterValue').textContent = l1Value !== null ? l1Value.toString() : 'N/A';
+        if (l1ProxyOnL2) {
+          const shortProxy = l1ProxyOnL2.slice(0, 8) + '...' + l1ProxyOnL2.slice(-4);
+          document.getElementById('l1CounterL2Proxy').textContent = shortProxy;
+          document.getElementById('l1CounterL2Proxy').title = l1ProxyOnL2;
+        } else {
+          document.getElementById('l1CounterL2Proxy').textContent = 'N/A';
+        }
+
+        // Update L2 Counter display
+        document.getElementById('l2CounterValue').textContent = l2Value !== null ? l2Value.toString() : 'N/A';
+        if (l2ProxyOnL1) {
+          const shortProxy = l2ProxyOnL1.slice(0, 8) + '...' + l2ProxyOnL1.slice(-4);
+          document.getElementById('l2CounterL1Proxy').textContent = shortProxy;
+          document.getElementById('l2CounterL1Proxy').title = l2ProxyOnL1;
+        } else {
+          document.getElementById('l2CounterL1Proxy').textContent = 'Not set';
+        }
+
+        // Update sync status
+        const syncStatusEl = document.getElementById('counterSyncStatus');
+        if (l1Value !== null && l2Value !== null) {
+          if (l1Value.toString() === l2Value.toString()) {
+            syncStatusEl.textContent = `SYNCED (both = ${l1Value})`;
+            syncStatusEl.className = 'status-value match';
+          } else {
+            syncStatusEl.textContent = `OUT OF SYNC (L1=${l1Value}, L2=${l2Value})`;
+            syncStatusEl.className = 'status-value mismatch';
+          }
+        } else if (l1Value === null && l2Value === null) {
+          syncStatusEl.textContent = 'Contracts not deployed';
+          syncStatusEl.className = 'status-value';
+        } else {
+          syncStatusEl.textContent = 'Partial deployment';
+          syncStatusEl.className = 'status-value mismatch';
+        }
+
+      } catch (err) {
+        log(`SyncedCounter refresh failed: ${err.message}`, 'error');
+        document.getElementById('l1CounterValue').textContent = 'Error';
+        document.getElementById('l2CounterValue').textContent = 'Error';
+        document.getElementById('counterSyncStatus').textContent = 'Error';
+        document.getElementById('counterSyncStatus').className = 'status-value mismatch';
       }
     }
 

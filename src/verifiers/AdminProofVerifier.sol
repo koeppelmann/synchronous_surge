@@ -8,7 +8,7 @@ import {OutgoingCall, IProofVerifier} from "../interfaces/IProofVerifier.sol";
 /// @dev In production, replace with ZK verifier or TEE attestation verifier
 ///
 /// The proof covers the entire state transition chain:
-/// prevBlockHash → postExecutionStateHash → call[0].postCallStateHash → call[1].postCallStateHash → ...
+/// prevBlockHash → preOutgoingCallsStateHash → call[0].postCallStateHash → call[1].postCallStateHash → ...
 contract AdminProofVerifier is IProofVerifier {
     address public admin;
     address public owner;
@@ -26,11 +26,11 @@ contract AdminProofVerifier is IProofVerifier {
     }
 
     /// @notice Verify a proof by checking admin signature
-    /// @dev Signature covers: prevBlockHash, callDataHash, postExecutionStateHash, callsHash, resultsHash, finalStateHash
+    /// @dev Signature covers: prevBlockHash, rlpEncodedTxHash, preOutgoingCallsStateHash, callsHash, resultsHash, finalStateHash
     function verifyProof(
         bytes32 prevBlockHash,
-        bytes calldata callData,
-        bytes32 postExecutionStateHash,
+        bytes calldata rlpEncodedTx,
+        bytes32 preOutgoingCallsStateHash,
         OutgoingCall[] calldata outgoingCalls,
         bytes[] calldata expectedResults,
         bytes32 finalStateHash,
@@ -38,8 +38,8 @@ contract AdminProofVerifier is IProofVerifier {
     ) external view override returns (bool) {
         bytes32 messageHash = keccak256(abi.encode(
             prevBlockHash,
-            keccak256(callData),
-            postExecutionStateHash,
+            keccak256(rlpEncodedTx),
+            preOutgoingCallsStateHash,
             _hashCalls(outgoingCalls),
             _hashResults(expectedResults),
             finalStateHash

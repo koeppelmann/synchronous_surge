@@ -118,8 +118,10 @@ async function getL2AddressForProxy(proxyAddress: string): Promise<string | null
 interface BuilderSubmitRequest {
   signedTx: string;
   hints?: {
-    l2TargetAddress: string;
+    l2TargetAddress?: string;
     description?: string;
+    l2Addresses?: string[];  // L2 addresses that will be called (builder deploys proxies if needed)
+    isContractCall?: boolean;
   };
   sourceChain: "L1" | "L2";
 }
@@ -171,6 +173,13 @@ async function forwardToRpc(body: any): Promise<any> {
 const pendingL1ToL2Hints: Map<string, string> = new Map();
 
 /**
+ * Registry of L2 addresses that L1 contracts will call
+ * Key: L1 contract address (lowercase)
+ * Value: Array of L2 addresses that will be called
+ */
+const contractToL2AddressesCache: Map<string, string[]> = new Map();
+
+/**
  * Register a hint for an upcoming L1→L2 transaction
  * Called by the UI before sending the transaction
  */
@@ -180,56 +189,70 @@ function registerHint(proxyAddress: string, l2TargetAddress: string): void {
 }
 
 /**
- * Handle eth_sendRawTransaction by routing through builder
+ * Register L2 addresses that an L1 contract will call
+ * Called by the UI before sending the transaction
+ */
+function registerL2Addresses(l1Contract: string, l2Addresses: string[]): void {
+  contractToL2AddressesCache.set(
+    l1Contract.toLowerCase(),
+    l2Addresses.map(a => a.toLowerCase())
+  );
+  log("Proxy", `Registered L2 addresses for ${l1Contract}: ${l2Addresses.join(", ")}`);
+}
+
+/**
+ * Handle eth_sendRawTransaction by ALWAYS routing through builder
+ *
+ * The builder will:
+ * 1. Simulate the transaction to detect any L2 proxy calls
+ * 2. If L2 calls are detected: pre-register responses and broadcast
+ * 3. If no L2 calls: just forward to L1 node
+ *
+ * This keeps the proxy simple - it doesn't need to know which contracts
+ * interact with L2. The builder does the heavy lifting.
  */
 async function handleSendRawTransaction(
   signedTx: string,
   id: number | string
 ): Promise<any> {
   try {
-    // Parse the transaction to understand it
+    // Parse the transaction for logging purposes
     const tx = Transaction.from(signedTx);
     log("Proxy", `Intercepted tx from ${tx.from} to ${tx.to}`);
     log("Proxy", `  Value: ${ethers.formatEther(tx.value)} ETH`);
+    log("Proxy", `  Routing ALL transactions through builder...`);
 
-    // Check if destination is a known proxy address
+    // Check if we have a hint for the destination (L2 target for direct calls)
     const l2Target = tx.to ? proxyToL2Cache.get(tx.to.toLowerCase()) : null;
 
+    // Check if we have L2 addresses hint for this L1 contract
+    const l2Addresses = tx.to ? contractToL2AddressesCache.get(tx.to.toLowerCase()) : null;
+
+    // Build hints object
+    const hints: BuilderSubmitRequest["hints"] = {};
     if (l2Target) {
-      // This is an L1→L2 transaction - route through builder
-      log("Proxy", `  Detected L1→L2 tx to L2 address: ${l2Target}`);
-      log("Proxy", `  Routing through builder...`);
-
-      const result = await submitToBuilder({
-        signedTx,
-        hints: {
-          l2TargetAddress: l2Target,
-          description: `L1→L2 deposit to ${l2Target}`,
-        },
-        sourceChain: "L1",
-      });
-
-      log("Proxy", `  Builder accepted: ${result.l1TxHash}`);
-
-      // Return the L1 tx hash as the result
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: result.l1TxHash,
-      };
-    } else {
-      // Simple L1 transaction - forward directly to RPC
-      log("Proxy", `  Simple L1 tx - forwarding to RPC`);
-
-      const response = await forwardToRpc({
-        jsonrpc: "2.0",
-        id,
-        method: "eth_sendRawTransaction",
-        params: [signedTx],
-      });
-
-      return response;
+      hints.l2TargetAddress = l2Target;
+      hints.description = `L1→L2 transaction to ${l2Target}`;
     }
+    if (l2Addresses && l2Addresses.length > 0) {
+      hints.l2Addresses = l2Addresses;
+      log("Proxy", `  Including L2 addresses hint: ${l2Addresses.join(", ")}`);
+    }
+
+    const result = await submitToBuilder({
+      signedTx,
+      hints: Object.keys(hints).length > 0 ? hints : undefined,
+      sourceChain: "L1",
+    });
+
+    log("Proxy", `  Builder accepted: ${result.l1TxHash}`);
+
+    // Return the L1 tx hash as the result
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: result.l1TxHash,
+    };
   } catch (err: any) {
     log("Proxy", `Error handling tx: ${err.message}`);
     return {
@@ -278,6 +301,22 @@ async function handleRequest(
     return;
   }
 
+  // Register L2 addresses for an L1 contract (for proxy auto-deployment)
+  if (url.pathname === "/register-l2-addresses" && req.method === "POST") {
+    const body = await readBody(req);
+    const { l1Contract, l2Addresses } = JSON.parse(body);
+
+    if (l1Contract && Array.isArray(l2Addresses) && l2Addresses.length > 0) {
+      registerL2Addresses(l1Contract, l2Addresses);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, l1Contract, l2Addresses }));
+    } else {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing l1Contract or l2Addresses array" }));
+    }
+    return;
+  }
+
   if (url.pathname === "/status" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -285,6 +324,7 @@ async function handleRequest(
       rpcUrl: config.rpcUrl,
       builderUrl: config.builderUrl,
       registeredHints: proxyToL2Cache.size,
+      registeredL2Addresses: contractToL2AddressesCache.size,
     }));
     return;
   }
@@ -427,9 +467,10 @@ async function main() {
     log("Proxy", `  http://localhost:${config.port}`);
     log("Proxy", "");
     log("Proxy", "Endpoints:");
-    log("Proxy", `  POST /              - JSON-RPC (proxied)`);
-    log("Proxy", `  POST /register-hint - Register L1→L2 hint`);
-    log("Proxy", `  GET  /status        - Proxy status`);
+    log("Proxy", `  POST /                     - JSON-RPC (proxied)`);
+    log("Proxy", `  POST /register-hint        - Register L1→L2 hint`);
+    log("Proxy", `  POST /register-l2-addresses - Register L2 addresses for contract`);
+    log("Proxy", `  GET  /status               - Proxy status`);
   });
 }
 
