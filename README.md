@@ -1,10 +1,10 @@
-# Synchronous Surge - Native Rollup Core
+# Synchronous Rollup
 
-A minimal implementation of **Native Rollups** - L2s where state is a pure function of L1 state, proven and verified atomically with block submission.
+A minimal implementation of **Synchronous Rollups** - L2s where state is a pure function of L1 state, proven and verified atomically with block submission.
 
 ## Quick Start
 
-Start the complete Native Rollup environment with a single command:
+Start the complete Synchronous Rollup environment with a single command:
 
 ```bash
 cd synchronous_surge
@@ -48,7 +48,7 @@ Add these networks to your wallet (e.g., MetaMask, Rabby):
 
 ## Overview
 
-Native Rollups eliminate the 7-day withdrawal delays of optimistic rollups by proving each L2 state transition at submission time. This enables **instant L2→L1 bridging** and **synchronous cross-chain composability**.
+Synchronous Rollups eliminate the 7-day withdrawal delays of optimistic rollups by proving each L2 state transition at submission time. This enables **instant L2→L1 bridging** and **synchronous cross-chain composability**.
 
 ### Core Concept
 
@@ -83,7 +83,7 @@ Every L2 block:
 │  │                     │    │  (AdminProofVerifier)  │     │
 │  │  - l2BlockHash      │    └────────────────────────┘     │
 │  │  - l2BlockNumber    │                                   │
-│  │  - processCallOnL2()│                                   │
+│  │  - processSingleTxOnL2│                                   │
 │  │  - registerIncoming │                                   │
 │  │  - handleIncoming   │                                   │
 │  └──────────┬──────────┘                                   │
@@ -248,16 +248,14 @@ forge script script/Deploy.s.sol --rpc-url https://rpc.gnosischain.com --broadca
 
 ## Bidirectional L1↔L2 Sync
 
-### L2→L1: Outgoing Calls (processCallOnL2)
+### L2→L1: Outgoing Calls (processSingleTxOnL2)
 
 L2 contracts include `OutgoingCall[]` in state transitions. The NativeRollupCore executes these calls on L1 via deterministic proxies.
 
 ```solidity
-nativeRollupCore.processCallOnL2{value: depositAmount}(
-    prevL2BlockHash,      // Current L2 state commitment
-    callData,             // Input that was "executed" on L2
-    postExecutionState,   // L2 state after execution, before L1 calls
-    outgoingCalls,        // Array of L1 calls with per-call state hashes
+nativeRollupCore.processSingleTxOnL2{value: depositAmount}(
+    rawTransaction,       // RLP-encoded signed L2 transaction
+    outgoingCalls,        // Array of L1 calls triggered by L2 execution
     expectedResults,      // Expected return data from L1 calls
     finalStateHash,       // Final L2 state after all calls
     proof                 // Proof of valid state transition chain
@@ -356,7 +354,7 @@ The sequencer (`sequencer/index.ts`) watches L1 for events and replays on L2:
 
 ### Events Watched
 
-1. **`L2BlockProcessed`**: L2→L1 flow via `processCallOnL2`
+1. **`L2BlockProcessed`**: L2→L1 flow via `processSingleTxOnL2`
 2. **`IncomingCallHandled`**: L1→L2 flow via proxy calls
 
 ### L2 Replay
