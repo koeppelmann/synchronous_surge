@@ -210,6 +210,91 @@
       color: #dc3545;
     }
 
+    /* State History */
+    .state-block {
+      background: white;
+      border-radius: 6px;
+      padding: 12px;
+      margin-bottom: 8px;
+      border-left: 4px solid #4a90d9;
+      font-size: 12px;
+    }
+    .state-block.genesis {
+      border-left-color: #28a745;
+    }
+    .state-block.l2-block {
+      border-left-color: #4a90d9;
+    }
+    .state-block.incoming-call {
+      border-left-color: #fd7e14;
+    }
+    .state-block .event-type {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+      margin-left: 8px;
+    }
+    .state-block .event-type.l2-tx {
+      background: #e7f3ff;
+      color: #4a90d9;
+    }
+    .state-block .event-type.l1-to-l2 {
+      background: #fff3e6;
+      color: #fd7e14;
+    }
+    .state-block .block-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .state-block .block-number {
+      font-weight: 600;
+      color: #333;
+    }
+    .state-block .block-time {
+      font-size: 11px;
+      color: #999;
+    }
+    .state-block .state-transition {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: monospace;
+      font-size: 11px;
+    }
+    .state-block .hash {
+      background: #f8f9fa;
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      max-width: 120px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .state-block .hash:hover {
+      background: #e9ecef;
+    }
+    .state-block .arrow {
+      color: #666;
+      font-size: 14px;
+    }
+    .state-block .tx-info {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid #e9ecef;
+      font-size: 11px;
+      color: #666;
+    }
+    .state-block .tx-info code {
+      background: #f8f9fa;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
+
     /* Balances Table */
     .balances-table {
       width: 100%;
@@ -438,7 +523,7 @@
         <h3>L1 SyncedCounter</h3>
         <div class="status-row">
           <span class="status-label">Address</span>
-          <span class="status-value hash copyable" id="l1CounterAddress" title="0x2E983A1Ba5e8b38AAAeC4B440B9dDcFBf72E15d1" onclick="copyToClipboard(this)">0x2E98...5d1</span>
+          <span class="status-value hash copyable" id="l1CounterAddress" title="0x663F3ad617193148711d28f5334eE4Ed07016602" onclick="copyToClipboard(this)">0x663F...602</span>
         </div>
         <div class="status-row">
           <span class="status-label">Value</span>
@@ -473,6 +558,17 @@
       <span class="status-value" id="counterSyncStatus">-</span>
     </div>
 
+    <!-- L2 State History -->
+    <h3 style="margin-top: 20px; margin-bottom: 10px; font-size: 14px; color: #555;">
+      L2 State History
+      <button class="toggle-btn" id="refreshHistory" style="margin-left: 10px;">Refresh</button>
+    </h3>
+    <div class="state-history-container" style="max-height: 300px; overflow-y: auto; background: #f8f9fa; border-radius: 8px; padding: 10px;">
+      <div id="stateHistoryContent">
+        <div style="text-align: center; color: #999; padding: 20px;">Loading state history...</div>
+      </div>
+    </div>
+
     <!-- Account Balances -->
     <h3 style="margin-top: 20px; margin-bottom: 10px; font-size: 14px; color: #555;">Account Balances</h3>
     <table class="balances-table">
@@ -497,21 +593,43 @@
       <button class="toggle-btn" id="toggleSettings">Show</button>
     </h2>
     <div id="settingsContent" class="collapsible-content collapsed">
-      <div class="row">
-        <div class="form-group">
-          <label>L1 RPC URL</label>
-          <input type="text" id="l1Rpc" value="http://localhost:8545" />
-        </div>
-        <div class="form-group">
-          <label>L2 RPC URL</label>
-          <input type="text" id="l2Rpc" value="http://localhost:9546" />
-        </div>
-      </div>
-      <div class="row">
-        <div class="form-group">
-          <label>Builder API URL</label>
-          <input type="text" id="builderUrl" value="http://localhost:3200" />
-        </div>
+      <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <thead>
+          <tr style="text-align:left; border-bottom:1px solid #333;">
+            <th style="padding:4px 8px;">Service</th>
+            <th style="padding:4px 8px;">URL / Address</th>
+            <th style="padding:4px 8px;">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="padding:4px 8px;">L1 Anvil</td>
+            <td style="padding:4px 8px;"><input type="text" id="l1Rpc" value="http://localhost:8545" style="width:100%;" /></td>
+            <td style="padding:4px 8px;"><span id="statusL1Anvil" class="status-value">—</span></td>
+          </tr>
+          <tr>
+            <td style="padding:4px 8px;">L1 Proxy</td>
+            <td style="padding:4px 8px;"><input type="text" id="l1ProxyRpc" value="http://localhost:8546" style="width:100%;" /></td>
+            <td style="padding:4px 8px;"><span id="statusL1Proxy" class="status-value">—</span></td>
+          </tr>
+          <tr>
+            <td style="padding:4px 8px;">Fullnode (L2)</td>
+            <td style="padding:4px 8px;"><input type="text" id="l2Rpc" value="http://localhost:9547" style="width:100%;" /></td>
+            <td style="padding:4px 8px;"><span id="statusFullnode" class="status-value">—</span></td>
+          </tr>
+          <tr>
+            <td style="padding:4px 8px;">L2 Proxy</td>
+            <td style="padding:4px 8px;"><input type="text" id="l2ProxyRpc" value="http://localhost:9548" style="width:100%;" /></td>
+            <td style="padding:4px 8px;"><span id="statusL2Proxy" class="status-value">—</span></td>
+          </tr>
+          <tr>
+            <td style="padding:4px 8px;">Builder</td>
+            <td style="padding:4px 8px;"><input type="text" id="builderUrl" value="http://localhost:3200" style="width:100%;" /></td>
+            <td style="padding:4px 8px;"><span id="statusBuilder" class="status-value">—</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="row" style="margin-top:8px;">
         <div class="form-group">
           <label>Rollup Contract Address</label>
           <input type="text" id="rollupAddress" value="0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512" />
@@ -549,6 +667,18 @@
 
     <div class="form-group">
       <label>To Address</label>
+      <select id="contractSelect" style="margin-bottom: 6px;">
+        <option value="">-- Select a contract --</option>
+        <optgroup label="L1 Contracts">
+          <option value="0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512" data-chain="L1">NativeRollupCore</option>
+          <option value="0x663F3ad617193148711d28f5334eE4Ed07016602" data-chain="L1">L1 SyncedCounter</option>
+          <option value="0xa513E6E4b8f2a923D98304ec87F64353C4D5C853" data-chain="L1">SyncDemo</option>
+        </optgroup>
+        <optgroup label="L2 Contracts">
+          <option value="0x663F3ad617193148711d28f5334eE4Ed07016602" data-chain="L2" data-l2="true">L2 SyncedCounter</option>
+        </optgroup>
+        <option value="custom">Custom address...</option>
+      </select>
       <input type="text" id="toAddress" placeholder="0x..." />
       <div class="checkbox-group" style="margin-top: 8px;">
         <input type="checkbox" id="isL2Target" />
@@ -556,6 +686,7 @@
           Target is on <span id="targetChainLabel">L2</span> (translate to proxy address)
         </label>
       </div>
+      <div id="codeCheckInfo" class="hidden" style="margin-bottom:6px; font-size:12px;"></div>
       <div id="proxyInfo" class="proxy-info hidden">
         Proxy address: <code id="proxyAddress"></code>
       </div>
@@ -642,6 +773,8 @@
       "function l2BlockNumber() view returns (uint256)",
       "function getProxyAddress(address l2Address) view returns (address)",
       "function isProxyDeployed(address l2Address) view returns (bool)",
+      "event L2BlockProcessed(uint256 indexed blockNumber, bytes32 indexed prevBlockHash, bytes32 indexed newBlockHash, bytes rlpEncodedTx, tuple(address from, address target, uint256 value, uint256 gas, bytes data, bytes32 postCallStateHash)[] outgoingCalls, bytes[] outgoingCallResults)",
+      "event IncomingCallHandled(address indexed l2Address, address indexed l1Caller, bytes32 indexed prevBlockHash, bytes callData, uint256 value, tuple(address from, address target, uint256 value, uint256 gas, bytes data, bytes32 postCallStateHash)[] outgoingCalls, bytes[] outgoingCallResults, bytes32 finalStateHash)",
     ];
 
     const SYNCED_COUNTER_ABI = [
@@ -649,8 +782,19 @@
       "function l1ContractProxy() view returns (address)",
     ];
 
+    function copyBlockRaw(idx) {
+      const block = window._stateChainRaw?.[idx];
+      if (!block) return;
+      // Serialize with BigInt support
+      const raw = JSON.stringify(block, (k, v) => typeof v === 'bigint' ? v.toString() : v, 2);
+      navigator.clipboard.writeText(raw).then(() => {
+        const btn = document.querySelectorAll('[onclick^="copyBlockRaw"]')[idx];
+        if (btn) { const orig = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = orig, 1500); }
+      });
+    }
+
     // SyncedCounter addresses from start.sh
-    const L1_SYNCED_COUNTER = '0x2E983A1Ba5e8b38AAAeC4B440B9dDcFBf72E15d1';
+    const L1_SYNCED_COUNTER = '0x663F3ad617193148711d28f5334eE4Ed07016602';
     const L2_SYNCED_COUNTER = '0x663F3ad617193148711d28f5334eE4Ed07016602';
 
     // ============ Network Configuration ============
@@ -669,7 +813,8 @@
       },
     };
 
-    const RPC_PROXY_URL = 'http://localhost:8546';
+    function getRpcProxyUrl() { return document.getElementById('l1ProxyRpc').value; }
+    const RPC_PROXY_URL = 'http://localhost:8546'; // legacy ref
     const PROXY_DETECTION_ADDRESS = '0x00000000000000000000000050524f5859525043';
     const PROXY_DETECTION_MAGIC_BALANCE = BigInt('0x50524f5859525043');
     const L2_PROXY_DETECTION_ADDRESS = '0x0000000000000000000000004c3250524f585952';
@@ -714,10 +859,46 @@
     }
 
     // ============ Status Dashboard ============
+    async function checkServiceHealth() {
+      const services = [
+        { id: 'statusL1Anvil', url: document.getElementById('l1Rpc').value },
+        { id: 'statusL1Proxy', url: document.getElementById('l1ProxyRpc').value },
+        { id: 'statusFullnode', url: document.getElementById('l2Rpc').value },
+        { id: 'statusL2Proxy', url: document.getElementById('l2ProxyRpc').value },
+        { id: 'statusBuilder', url: document.getElementById('builderUrl').value, path: '/status' },
+      ];
+
+      await Promise.all(services.map(async (svc) => {
+        const el = document.getElementById(svc.id);
+        try {
+          const url = svc.path ? svc.url + svc.path : svc.url;
+          const body = svc.path ? undefined : JSON.stringify({ jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 });
+          const resp = await fetch(url, {
+            method: svc.path ? 'GET' : 'POST',
+            headers: svc.path ? {} : { 'Content-Type': 'application/json' },
+            body,
+            signal: AbortSignal.timeout(2000),
+          });
+          if (resp.ok) {
+            el.textContent = '● Online';
+            el.className = 'status-value match';
+          } else {
+            el.textContent = '○ Error';
+            el.className = 'status-value mismatch';
+          }
+        } catch {
+          el.textContent = '○ Offline';
+          el.className = 'status-value mismatch';
+        }
+      }));
+    }
+
     async function refreshStatus() {
       const indicator = document.getElementById('refreshIndicator');
       indicator.textContent = 'Refreshing...';
       indicator.className = 'refresh-indicator loading';
+
+      checkServiceHealth();
 
       try {
         const l1Rpc = document.getElementById('l1Rpc').value;
@@ -876,6 +1057,327 @@
         document.getElementById('l2CounterValue').textContent = 'Error';
         document.getElementById('counterSyncStatus').textContent = 'Error';
         document.getElementById('counterSyncStatus').className = 'status-value mismatch';
+      }
+    }
+
+    // ============ Calldata Decoder ============
+    const KNOWN_FUNCTIONS = {
+      '0x55241077': { name: 'setValue', sig: 'setValue(uint256)', params: ['uint256'] },
+      '0x96fc4414': { name: 'setL2Proxy', sig: 'setL2Proxy(address)', params: ['address'] },
+      '0x549290ad': { name: 'setL1ContractProxy', sig: 'setL1ContractProxy(address)', params: ['address'] },
+      '0xec63d87f': { name: 'setL1Counter', sig: 'setL1Counter(address)', params: ['address'] },
+      '0x3fa4f245': { name: 'value', sig: 'value()', params: [] },
+    };
+
+    function decodeCalldata(data) {
+      if (!data || data.length < 10) {
+        return { decoded: false, raw: data || '0x' };
+      }
+
+      // Normalize: ensure lowercase and proper 0x prefix
+      const normalizedData = data.toLowerCase();
+      const selector = normalizedData.slice(0, 10);
+      const funcInfo = KNOWN_FUNCTIONS[selector];
+
+      // Debug logging (can be removed later)
+      // console.log('Decoding:', { data, selector, found: !!funcInfo });
+
+      if (!funcInfo) {
+        return { decoded: false, raw: data, selector };
+      }
+
+      try {
+        const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+        const paramsData = '0x' + normalizedData.slice(10);
+
+        if (funcInfo.params.length === 0) {
+          return {
+            decoded: true,
+            name: funcInfo.name,
+            sig: funcInfo.sig,
+            args: [],
+            formatted: `${funcInfo.name}()`
+          };
+        }
+
+        const decoded = abiCoder.decode(funcInfo.params, paramsData);
+        const args = decoded.map((arg, i) => {
+          if (funcInfo.params[i] === 'address') {
+            return arg;
+          } else if (funcInfo.params[i] === 'uint256') {
+            return arg.toString();
+          }
+          return arg.toString();
+        });
+
+        return {
+          decoded: true,
+          name: funcInfo.name,
+          sig: funcInfo.sig,
+          args,
+          formatted: `${funcInfo.name}(${args.join(', ')})`
+        };
+      } catch (e) {
+        return { decoded: false, raw: data, selector, error: e.message };
+      }
+    }
+
+    function formatCalldata(data, value) {
+      const decoded = decodeCalldata(data);
+      const valueStr = value && value > 0n ? ` {value: ${ethers.formatEther(value)} ETH}` : '';
+
+      if (decoded.decoded) {
+        return `<span class="decoded-call" style="color: #28a745; font-weight: 500;">${decoded.formatted}</span>${valueStr}`;
+      } else if (decoded.selector) {
+        return `<code class="copyable" title="${data}" onclick="copyToClipboard(this)">${decoded.selector}...</code>${valueStr}`;
+      } else {
+        return `<code class="copyable" title="${data}" onclick="copyToClipboard(this)">${decoded.raw}</code>${valueStr}`;
+      }
+    }
+
+    // ============ L2 State History ============
+    async function refreshStateHistory() {
+      const container = document.getElementById('stateHistoryContent');
+
+      try {
+        const l1Rpc = document.getElementById('l1Rpc').value;
+        const rollupAddr = document.getElementById('rollupAddress').value;
+
+        const l1Provider = new ethers.JsonRpcProvider(l1Rpc);
+        const rollup = new ethers.Contract(rollupAddr, ROLLUP_ABI, l1Provider);
+
+        // Get current state
+        const currentStateHash = await rollup.l2BlockHash();
+
+        // Query both event types
+        const [l2BlockEvents, incomingCallEvents] = await Promise.all([
+          rollup.queryFilter(rollup.filters.L2BlockProcessed(), 0, 'latest'),
+          rollup.queryFilter(rollup.filters.IncomingCallHandled(), 0, 'latest'),
+        ]);
+
+        // Build unified state chain
+        const stateChain = [];
+
+        // Add genesis (block 0) - use first L2BlockProcessed event's prevBlockHash
+        if (l2BlockEvents.length > 0) {
+          const firstEvent = l2BlockEvents[0];
+          stateChain.push({
+            eventType: 'genesis',
+            prevHash: null,
+            newHash: firstEvent.args.prevBlockHash,
+            l1Block: null,
+            l1Timestamp: null,
+            txHash: null,
+          });
+        }
+
+        // Process L2BlockProcessed events
+        for (const event of l2BlockEvents) {
+          const l1Block = await l1Provider.getBlock(event.blockNumber);
+
+          // Decode the RLP-encoded L2 transaction
+          let txFrom = null, txTo = null, txData = null, txValue = null;
+          try {
+            const decodedTx = ethers.Transaction.from(event.args.rlpEncodedTx);
+            txFrom = decodedTx.from;
+            txTo = decodedTx.to;
+            txData = decodedTx.data;
+            txValue = decodedTx.value;
+          } catch (e) {
+            console.log('Failed to decode tx:', e);
+          }
+
+          stateChain.push({
+            eventType: 'L2BlockProcessed',
+            blockNumber: Number(event.args.blockNumber),
+            prevHash: event.args.prevBlockHash,
+            newHash: event.args.newBlockHash,
+            l1Block: event.blockNumber,
+            l1Timestamp: l1Block ? new Date(l1Block.timestamp * 1000) : null,
+            txHash: event.transactionHash,
+            outgoingCalls: event.args.outgoingCalls || [],
+            outgoingCallResults: event.args.outgoingCallResults || [],
+            txFrom,
+            txTo,
+            txData,
+            txValue,
+          });
+        }
+
+        // Process IncomingCallHandled events
+        for (const event of incomingCallEvents) {
+          const l1Block = await l1Provider.getBlock(event.blockNumber);
+
+          stateChain.push({
+            eventType: 'IncomingCallHandled',
+            prevHash: event.args.prevBlockHash,
+            newHash: event.args.finalStateHash,
+            l1Block: event.blockNumber,
+            l1Timestamp: l1Block ? new Date(l1Block.timestamp * 1000) : null,
+            txHash: event.transactionHash,
+            outgoingCalls: event.args.outgoingCalls || [],
+            outgoingCallResults: event.args.outgoingCallResults || [],
+            l2Address: event.args.l2Address,
+            l1Caller: event.args.l1Caller,
+            txData: event.args.callData,
+            txValue: event.args.value,
+          });
+        }
+
+        // Sort by L1 block number, then by transaction index within block
+        stateChain.sort((a, b) => {
+          if (a.eventType === 'genesis') return -1;
+          if (b.eventType === 'genesis') return 1;
+          if (a.l1Block !== b.l1Block) return a.l1Block - b.l1Block;
+          // If same block, maintain order by tx hash (approximation)
+          return (a.txHash || '').localeCompare(b.txHash || '');
+        });
+
+        // Render state chain (genesis first, then chronological order)
+        if (stateChain.length === 0) {
+          container.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">No L2 blocks processed yet</div>';
+          return;
+        }
+
+        // Store raw data for copy button
+        window._stateChainRaw = stateChain;
+
+        const html = stateChain.map((block, idx) => {
+          const copyBtnHtml = `<button onclick="copyBlockRaw(${idx})" style="float:right;font-size:10px;padding:2px 6px;cursor:pointer;background:#444;color:#fff;border:1px solid #666;border-radius:3px;">Copy Raw</button>`;
+
+          const shortPrev = block.prevHash ? block.prevHash.slice(0, 10) + '...' + block.prevHash.slice(-6) : 'Genesis';
+          const shortNew = block.newHash.slice(0, 10) + '...' + block.newHash.slice(-6);
+          const isCurrentState = block.newHash.toLowerCase() === currentStateHash.toLowerCase();
+
+          // Genesis block
+          if (block.eventType === 'genesis') {
+            return `
+              <div class="state-block genesis">
+                <div class="block-header">
+                  <span class="block-number">Genesis State (Block #0)</span>
+                  ${copyBtnHtml}
+                </div>
+                <div class="state-transition">
+                  <span class="hash copyable" title="${block.newHash}" onclick="copyToClipboard(this)">${shortNew}</span>
+                  ${isCurrentState ? '<span style="color: #28a745; font-weight: 600;">← Current</span>' : ''}
+                </div>
+              </div>
+            `;
+          }
+
+          const timeStr = block.l1Timestamp ? block.l1Timestamp.toLocaleTimeString() : '';
+
+          // Format outgoing calls if any
+          let outgoingCallsHtml = '';
+          if (block.outgoingCalls && block.outgoingCalls.length > 0) {
+            const results = block.outgoingCallResults || [];
+            outgoingCallsHtml = `
+              <div class="outgoing-calls" style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed #ddd;">
+                <span style="font-size: 10px; color: #666;">L2→L1 Calls (${block.outgoingCalls.length}):</span>
+                ${block.outgoingCalls.map((call, i) => {
+                  const callTo = call.target ? call.target.slice(0, 8) + '...' + call.target.slice(-4) : 'N/A';
+                  const callDataHtml = formatCalldata(call.data, call.value);
+                  const resultData = results[i];
+                  let resultHtml = '';
+                  if (resultData && resultData !== '0x') {
+                    const shortResult = resultData.length > 20 ? resultData.slice(0, 20) + '...' : resultData;
+                    resultHtml = ` <span style="color: #17a2b8;">⇒ <code class="copyable" title="${resultData}" onclick="copyToClipboard(this)">${shortResult}</code></span>`;
+                  }
+                  return `<div style="font-size: 11px; margin-left: 10px;">
+                    #${i+1}: → <code class="copyable" title="${call.target}" onclick="copyToClipboard(this)">${callTo}</code>
+                    ${callDataHtml}${resultHtml}
+                  </div>`;
+                }).join('')}
+              </div>
+            `;
+          }
+
+          // L2BlockProcessed event (L2 transaction)
+          if (block.eventType === 'L2BlockProcessed') {
+            const shortFrom = block.txFrom ? block.txFrom.slice(0, 8) + '...' + block.txFrom.slice(-4) : 'N/A';
+            const shortTo = block.txTo ? block.txTo.slice(0, 8) + '...' + block.txTo.slice(-4) : '(deploy)';
+            const calldataHtml = formatCalldata(block.txData, block.txValue);
+
+            return `
+              <div class="state-block l2-block">
+                <div class="block-header">
+                  <span class="block-number">
+                    L2 Block #${block.blockNumber}
+                    <span class="event-type l2-tx">L2 TX</span>
+                  </span>
+                  <span class="block-time">${timeStr} (L1 #${block.l1Block})</span>
+                  ${copyBtnHtml}
+                </div>
+                <div class="state-transition">
+                  <span class="hash copyable" title="${block.prevHash}" onclick="copyToClipboard(this)">${shortPrev}</span>
+                  <span class="arrow">→</span>
+                  <span class="hash copyable" title="${block.newHash}" onclick="copyToClipboard(this)">${shortNew}</span>
+                  ${isCurrentState ? '<span style="color: #28a745; font-weight: 600;">← Current</span>' : ''}
+                </div>
+                <div class="tx-info">
+                  <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                    <span>From: <code class="copyable" title="${block.txFrom}" onclick="copyToClipboard(this)">${shortFrom}</code></span>
+                    <span>To: <code class="copyable" title="${block.txTo || ''}" onclick="copyToClipboard(this)">${shortTo}</code></span>
+                  </div>
+                  <div style="margin-top: 4px;">
+                    Call: ${calldataHtml}
+                  </div>
+                  <div style="margin-top: 2px; font-size: 11px; color: #666;">
+                    L1 TX: <code class="copyable" title="${block.txHash}" onclick="copyToClipboard(this)">${block.txHash?.slice(0, 10)}...</code>
+                  </div>
+                  ${outgoingCallsHtml}
+                </div>
+              </div>
+            `;
+          }
+
+          // IncomingCallHandled event (L1→L2 call)
+          if (block.eventType === 'IncomingCallHandled') {
+            const shortL2Addr = block.l2Address ? block.l2Address.slice(0, 8) + '...' + block.l2Address.slice(-4) : 'N/A';
+            const shortL1Caller = block.l1Caller ? block.l1Caller.slice(0, 8) + '...' + block.l1Caller.slice(-4) : 'N/A';
+            const calldataHtml = formatCalldata(block.txData, block.txValue);
+
+            return `
+              <div class="state-block incoming-call">
+                <div class="block-header">
+                  <span class="block-number">
+                    L1→L2 Call
+                    <span class="event-type l1-to-l2">INCOMING</span>
+                  </span>
+                  <span class="block-time">${timeStr} (L1 #${block.l1Block})</span>
+                  ${copyBtnHtml}
+                </div>
+                <div class="state-transition">
+                  <span class="hash copyable" title="${block.prevHash}" onclick="copyToClipboard(this)">${shortPrev}</span>
+                  <span class="arrow">→</span>
+                  <span class="hash copyable" title="${block.newHash}" onclick="copyToClipboard(this)">${shortNew}</span>
+                  ${isCurrentState ? '<span style="color: #28a745; font-weight: 600;">← Current</span>' : ''}
+                </div>
+                <div class="tx-info">
+                  <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                    <span>L1 Caller: <code class="copyable" title="${block.l1Caller}" onclick="copyToClipboard(this)">${shortL1Caller}</code></span>
+                    <span>L2 Target: <code class="copyable" title="${block.l2Address}" onclick="copyToClipboard(this)">${shortL2Addr}</code></span>
+                  </div>
+                  <div style="margin-top: 4px;">
+                    Call: ${calldataHtml}
+                  </div>
+                  <div style="margin-top: 2px; font-size: 11px; color: #666;">
+                    L1 TX: <code class="copyable" title="${block.txHash}" onclick="copyToClipboard(this)">${block.txHash?.slice(0, 10)}...</code>
+                  </div>
+                  ${outgoingCallsHtml}
+                </div>
+              </div>
+            `;
+          }
+
+          return ''; // Unknown event type
+        }).join('');
+
+        container.innerHTML = html;
+
+      } catch (err) {
+        container.innerHTML = `<div style="text-align: center; color: #dc3545; padding: 20px;">Error: ${err.message}</div>`;
+        log(`State history refresh failed: ${err.message}`, 'error');
       }
     }
 
@@ -1054,15 +1556,64 @@
       updateTxSummary();
     }
 
+    // ============ Contract Dropdown ============
+    document.getElementById('contractSelect').addEventListener('change', function() {
+      const select = this;
+      const option = select.options[select.selectedIndex];
+      const toInput = document.getElementById('toAddress');
+      const isL2Checkbox = document.getElementById('isL2Target');
+
+      if (select.value === '' || select.value === 'custom') {
+        if (select.value === 'custom') toInput.value = '';
+        toInput.style.display = '';
+        toInput.focus();
+      } else {
+        toInput.value = select.value;
+        toInput.style.display = 'none';
+        // Auto-set L2 target checkbox
+        isL2Checkbox.checked = option.dataset.l2 === 'true';
+      }
+      updateProxyAddress();
+      checkAddressCode();
+      updateTransactionSummary();
+    });
+    // Initially hide manual input if a contract is selected
+    document.getElementById('toAddress').style.display = '';
+
+    // ============ Address Code Check ============
+    async function checkAddressCode() {
+      const el = document.getElementById('codeCheckInfo');
+      const addr = document.getElementById('toAddress').value;
+      if (!addr || !ethers.isAddress(addr)) {
+        el.classList.add('hidden');
+        return;
+      }
+      try {
+        const l1Rpc = document.getElementById('l1Rpc').value;
+        const p = new ethers.JsonRpcProvider(l1Rpc);
+        const code = await p.getCode(addr);
+        if (!code || code === '0x') {
+          el.innerHTML = `⚠️ <strong>Warning:</strong> No contract code at <code>${addr.slice(0,8)}...${addr.slice(-4)}</code> on L1`;
+          el.style.color = '#dc3545';
+          el.classList.remove('hidden');
+        } else {
+          el.innerHTML = `✓ Contract found at <code>${addr.slice(0,8)}...${addr.slice(-4)}</code> (${code.length / 2 - 1} bytes)`;
+          el.style.color = '#28a745';
+          el.classList.remove('hidden');
+        }
+      } catch {
+        el.classList.add('hidden');
+      }
+    }
+
     // ============ Proxy Address ============
-    document.getElementById('toAddress').addEventListener('input', updateProxyAddress);
-    document.getElementById('isL2Target').addEventListener('change', updateProxyAddress);
+    document.getElementById('toAddress').addEventListener('input', () => { updateProxyAddress(); checkAddressCode(); });
+    document.getElementById('isL2Target').addEventListener('change', () => { updateProxyAddress(); checkAddressCode(); });
 
     async function updateProxyAddress() {
       const toAddr = document.getElementById('toAddress').value;
       const isL2Target = document.getElementById('isL2Target').checked;
       const proxyInfo = document.getElementById('proxyInfo');
-      const proxyAddrEl = document.getElementById('proxyAddress');
 
       if (!isL2Target || !toAddr || !ethers.isAddress(toAddr)) {
         proxyInfo.classList.add('hidden');
@@ -1070,15 +1621,29 @@
       }
 
       try {
+        const l1Rpc = document.getElementById('l1Rpc').value;
+        const l1Prov = new ethers.JsonRpcProvider(l1Rpc);
         if (!rollupContract) {
           const rollupAddr = document.getElementById('rollupAddress').value;
-          const l1Rpc = document.getElementById('l1Rpc').value;
-          const l1Provider = new ethers.JsonRpcProvider(l1Rpc);
-          rollupContract = new ethers.Contract(rollupAddr, ROLLUP_ABI, l1Provider);
+          rollupContract = new ethers.Contract(rollupAddr, ROLLUP_ABI, l1Prov);
         }
 
         const proxyAddr = await rollupContract.getProxyAddress(toAddr);
-        proxyAddrEl.textContent = proxyAddr;
+        const proxyCode = await l1Prov.getCode(proxyAddr);
+        const hasCode = proxyCode && proxyCode !== '0x' && proxyCode.length >= 10;
+
+        // Store proxy address for tx submission
+        proxyInfo.dataset.proxyAddr = proxyAddr;
+
+        if (hasCode) {
+          proxyInfo.style.background = '#fffbe6';
+          proxyInfo.style.borderColor = '#ffe58f';
+          proxyInfo.innerHTML = `Proxy address: <code>${proxyAddr}</code>`;
+        } else {
+          proxyInfo.style.background = '#fff1f0';
+          proxyInfo.style.borderColor = '#ffa39e';
+          proxyInfo.innerHTML = `⚠️ <strong>Warning:</strong> Proxy <code>${proxyAddr.slice(0,10)}...${proxyAddr.slice(-4)}</code> has <strong>no code</strong> yet. The builder will deploy it when you submit.`;
+        }
         proxyInfo.classList.remove('hidden');
       } catch (err) {
         proxyInfo.classList.add('hidden');
@@ -1131,7 +1696,7 @@
         return;
       }
 
-      const proxyAddr = document.getElementById('proxyAddress').textContent;
+      const proxyAddr = document.getElementById('proxyInfo').dataset.proxyAddr || '';
       const actualTo = isL2Target && proxyAddr ? proxyAddr : toAddr;
 
       let html = `<strong>From:</strong> ${walletAddress.slice(0,10)}...<br>`;
@@ -1167,10 +1732,20 @@
         let hints = null;
 
         if (isL2Target) {
-          const proxyAddr = document.getElementById('proxyAddress').textContent;
+          let proxyAddr = document.getElementById('proxyInfo').dataset.proxyAddr;
+          if (!proxyAddr) {
+            // Try to compute it on the fly
+            log('Proxy address not cached, computing...', 'info');
+            const l1Rpc = document.getElementById('l1Rpc').value;
+            const rollupAddr = document.getElementById('rollupAddress').value;
+            const tmpProvider = new ethers.JsonRpcProvider(l1Rpc);
+            const tmpRollup = new ethers.Contract(rollupAddr, ROLLUP_ABI, tmpProvider);
+            proxyAddr = await tmpRollup.getProxyAddress(toAddr);
+          }
           if (!proxyAddr) throw new Error('Could not get proxy address');
           actualTo = proxyAddr;
           hints = { l2TargetAddress: toAddr, description: `${connectedChain} tx to L2 address ${toAddr}` };
+          log(`L2 target: ${toAddr} → proxy: ${proxyAddr}`, 'info');
         }
 
         log(`Building transaction to ${actualTo}...`);
@@ -1183,6 +1758,12 @@
         const gasLimitInput = document.getElementById('gasLimit').value;
         if (gasLimitInput) {
           gasLimit = BigInt(gasLimitInput);
+        } else if (isL2Target) {
+          // L2 target: proxy may not exist yet, so estimateGas would return 21k.
+          // The builder will deploy the proxy + execute handleIncomingCall,
+          // which needs significantly more gas.
+          gasLimit = 500000n;
+          log(`Using L2 target gas limit: ${gasLimit}`, 'info');
         } else {
           try {
             const estimated = await provider.estimateGas({
@@ -1279,13 +1860,22 @@
       }
     });
 
+    // ============ State History Refresh Button ============
+    document.getElementById('refreshHistory').addEventListener('click', () => {
+      refreshStateHistory();
+    });
+
     // ============ Initialize ============
     log('Dashboard loaded.');
     updateUI();
     refreshStatus();
+    refreshStateHistory();
 
     // Auto-refresh every 10 seconds
-    statusRefreshInterval = setInterval(refreshStatus, 10000);
+    statusRefreshInterval = setInterval(() => {
+      refreshStatus();
+      refreshStateHistory();
+    }, 10000);
   </script>
 </body>
 </html>

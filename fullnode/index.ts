@@ -6,76 +6,96 @@
  * this fullnode can reconstruct the complete L2 state.
  *
  * Core principle: L2 state is a PURE FUNCTION of L1 state.
- * The fullnode watches L1 events and replays the corresponding
- * state changes on L2, maintaining the invariant that:
- *   L2 state root == l2BlockHash on L1
+ *
+ * Key design (matching builder):
+ * - L2 System Address is pre-funded in genesis (10 billion xDAI)
+ * - ALL L2 transactions originate from the system address
+ * - L1 callers are represented by L1SenderProxyL2 contracts on L2
+ * - System address calls proxy, proxy forwards to target
  *
  * Events processed:
  * 1. L2BlockProcessed: L2→L1 flow (processCallOnL2)
- *    - Decode callData and execute on L2
- *    - Outgoing calls already executed on L1, no L2 action needed
- *
- * 2. IncomingCallHandled: L1→L2 flow
- *    - Determine which L1 contract called which L2 contract
- *    - Impersonate L1 caller's proxy on L2 and execute
+ * 2. IncomingCallHandled: L1→L2 flow (deposits, calls)
  */
 
 import {
   ethers,
   Contract,
+  ContractFactory,
   JsonRpcProvider,
   AbiCoder,
   keccak256,
-  TransactionReceipt,
 } from "ethers";
 import { spawn, ChildProcess } from "child_process";
+import * as fs from "fs";
+import * as path from "path";
 
 // ============ Configuration ============
 
 export interface FullnodeConfig {
   l1Rpc: string;
   rollupAddress: string;
-  l2Port: number; // Port for the spawned Anvil L2 instance
+  l2Port: number;
   l2ChainId: number;
-  startFromBlock?: number; // L1 block to start syncing from (0 = genesis)
+  startFromBlock?: number;
 }
 
 const DEFAULT_CONFIG: FullnodeConfig = {
-  l1Rpc: process.env.L1_RPC || "http://localhost:9545",
+  l1Rpc: process.env.L1_RPC || "https://rpc.gnosischain.com",
+  // NativeRollupCore with processL2Transaction support
   rollupAddress:
-    process.env.ROLLUP_ADDRESS || "0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d",
+    process.env.ROLLUP_ADDRESS || "0xB98fA7a61102e6dA6dd67a4dC8F69013FF3872E1",
   l2Port: parseInt(process.env.L2_PORT || "9546"),
   l2ChainId: parseInt(process.env.L2_CHAIN_ID || "10200200"),
   startFromBlock: 0,
 };
 
+// ============ Constants ============
+
+/**
+ * L2 System Address - computed as:
+ * keccak256(encode("NativeRollup.L1SenderProxy.v1", NativeRollupCoreAddress))
+ *
+ * MUST match the builder's L2_SYSTEM_ADDRESS.
+ * Pre-funded in genesis with 10 billion xDAI.
+ *
+ * Computed for NativeRollupCore at 0xBdec2590117ED5D3ec3dca8EcC1E5d2CbEaedfAf
+ */
+export const L2_SYSTEM_ADDRESS = "0x7d1cc88909370e00d3ca1fd72d9b45b8f1412215";
+
+/**
+ * Genesis balance for L2 system address (10 billion xDAI in wei)
+ */
+export const L2_SYSTEM_BALANCE = ethers.parseEther("10000000000");
+
 // ============ ABI ============
 
 const ROLLUP_ABI = [
-  // Events
   "event L2BlockProcessed(uint256 indexed blockNumber, bytes32 indexed prevBlockHash, bytes32 indexed newBlockHash, uint256 outgoingCallsCount)",
   "event OutgoingCallExecuted(uint256 indexed blockNumber, uint256 indexed callIndex, address indexed from, address target, bool success)",
   "event L2SenderProxyDeployed(address indexed l2Address, address indexed proxyAddress)",
   "event IncomingCallRegistered(address indexed l2Address, bytes32 indexed stateHash, bytes32 indexed callDataHash, bytes32 responseKey)",
   "event IncomingCallHandled(address indexed l2Address, bytes32 indexed responseKey, uint256 outgoingCallsCount, uint256 value)",
-
-  // View functions
+  "event L2TransactionProcessed(uint256 indexed blockNumber, bytes32 indexed txHash, address indexed from, bytes32 newStateHash)",
   "function l2BlockHash() view returns (bytes32)",
   "function l2BlockNumber() view returns (uint256)",
   "function getProxyAddress(address l2Address) view returns (address)",
   "function incomingCallResponses(bytes32) view returns (bytes32 preOutgoingCallsStateHash, bytes returnValue, bytes32 finalStateHash)",
-
-  // State-changing functions (for decoding)
   "function processCallOnL2(bytes32 prevL2BlockHash, bytes calldata callData, bytes32 postExecutionStateHash, tuple(address from, address target, uint256 value, uint256 gas, bytes data, bytes32 postCallStateHash)[] outgoingCalls, bytes[] expectedResults, bytes32 finalStateHash, bytes proof) payable",
   "function registerIncomingCall(address l2Address, bytes32 stateHash, bytes calldata callData, tuple(bytes32 preOutgoingCallsStateHash, tuple(address from, address target, uint256 value, uint256 gas, bytes data, bytes32 postCallStateHash)[] outgoingCalls, bytes[] expectedResults, bytes returnValue, bytes32 finalStateHash) response, bytes proof)",
+  "function processL2Transaction(bytes rawTransaction, bytes32 finalStateHash, bytes proof)",
+];
+
+const L2_PROXY_FACTORY_ABI = [
+  "function deployProxy(address l1Address) returns (address)",
+  "function computeProxyAddress(address l1Address) view returns (address)",
+  "function isProxyDeployed(address l1Address) view returns (bool)",
+  "function getProxy(address l1Address) view returns (address)",
+  "function proxies(address) view returns (address)",
 ];
 
 // ============ Utility Functions ============
 
-/**
- * Compute the L2 proxy address for an L1 address.
- * This is the address we impersonate on L2 when an L1 contract makes a call.
- */
 export function computeL2ProxyAddress(l1Address: string): string {
   const hash = keccak256(
     AbiCoder.defaultAbiCoder().encode(
@@ -84,6 +104,26 @@ export function computeL2ProxyAddress(l1Address: string): string {
     )
   );
   return "0x" + hash.slice(-40);
+}
+
+function getContractArtifact(contractName: string): { abi: any; bytecode: string } {
+  // Try multiple possible paths
+  const possiblePaths = [
+    path.join(process.cwd(), `out/L1SenderProxyL2.sol/${contractName}.json`),
+    path.join(process.cwd(), `../out/L1SenderProxyL2.sol/${contractName}.json`),
+  ];
+
+  for (const artifactPath of possiblePaths) {
+    if (fs.existsSync(artifactPath)) {
+      const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+      return {
+        abi: artifact.abi,
+        bytecode: artifact.bytecode.object,
+      };
+    }
+  }
+
+  throw new Error(`Contract artifact not found for ${contractName}. Run 'forge build' first.`);
 }
 
 // ============ L2 Fullnode ============
@@ -95,6 +135,8 @@ export interface SyncStatus {
   isSynced: boolean;
   processedL2Blocks: number;
   processedIncomingCalls: number;
+  l2ProxyFactoryAddress: string | null;
+  l2CallRegistryAddress: string | null;
 }
 
 export class L2Fullnode {
@@ -104,14 +146,22 @@ export class L2Fullnode {
   private rollupCore: Contract;
   private anvilProcess: ChildProcess | null = null;
 
+  // L2 infrastructure
+  private l2ProxyFactory: Contract | null = null;
+  private l2CallRegistry: Contract | null = null;
+  private l2ProxyFactoryAddress: string | null = null;
+  private l2CallRegistryAddress: string | null = null;
+
   // Tracking state
   private processedL2Blocks: Set<number> = new Set();
   private processedIncomingCalls: Set<string> = new Set();
+  private processedL2Transactions: Set<string> = new Set(); // Track by txHash
   private lastL1Block: number = 0;
 
-  // Event handlers for extensibility
+  // Event handlers
   private onBlockProcessed?: (blockNumber: number, hash: string) => void;
   private onIncomingCallProcessed?: (l2Address: string, caller: string) => void;
+  private onL2TransactionProcessed?: (txHash: string, from: string) => void;
 
   constructor(config: Partial<FullnodeConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -124,8 +174,7 @@ export class L2Fullnode {
   }
 
   /**
-   * Spawn a fresh Anvil instance for L2
-   * The L2 state is derived purely from L1 - no external L2 endpoint needed
+   * Spawn L2 Anvil and set up genesis state (system address balance)
    */
   private async spawnL2Anvil(): Promise<void> {
     const l2Rpc = `http://localhost:${this.config.l2Port}`;
@@ -135,7 +184,8 @@ export class L2Fullnode {
     this.anvilProcess = spawn("anvil", [
       "--port", this.config.l2Port.toString(),
       "--chain-id", this.config.l2ChainId.toString(),
-      "--silent", // Reduce noise
+      "--accounts", "0", // No pre-funded accounts - only system address gets funded
+      "--silent",
     ], {
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -162,18 +212,91 @@ export class L2Fullnode {
         reject(new Error(`Failed to spawn Anvil: ${err.message}`));
       });
 
-      this.anvilProcess!.on("exit", (code) => {
-        if (code !== null && code !== 0) {
-          clearTimeout(timeout);
-          reject(new Error(`Anvil exited with code ${code}`));
-        }
-      });
-
       checkReady();
     });
 
     this.l2Provider = new JsonRpcProvider(l2Rpc);
+
+    // Fund the L2 system address (MUST match builder exactly)
+    console.log(`Funding L2 system address with 10B xDAI...`);
+    await this.l2Provider.send("anvil_setBalance", [
+      L2_SYSTEM_ADDRESS,
+      "0x" + L2_SYSTEM_BALANCE.toString(16),
+    ]);
+
+    const balance = await this.l2Provider.getBalance(L2_SYSTEM_ADDRESS);
+    console.log(`  System address balance: ${ethers.formatEther(balance)} xDAI`);
+
     console.log(`L2 Anvil ready at ${l2Rpc}`);
+  }
+
+  /**
+   * Deploy L2 infrastructure contracts (MUST match builder exactly)
+   */
+  private async deployL2Infrastructure(): Promise<void> {
+    console.log(`Deploying L2 infrastructure...`);
+
+    await this.l2Provider.send("anvil_impersonateAccount", [L2_SYSTEM_ADDRESS]);
+    const systemSigner = await this.l2Provider.getSigner(L2_SYSTEM_ADDRESS);
+
+    // Deploy L2CallRegistry
+    const registryArtifact = getContractArtifact("L2CallRegistry");
+    const registryFactory = new ContractFactory(
+      registryArtifact.abi,
+      registryArtifact.bytecode,
+      systemSigner
+    );
+    const registry = await registryFactory.deploy(L2_SYSTEM_ADDRESS);
+    await registry.waitForDeployment();
+    this.l2CallRegistryAddress = await registry.getAddress();
+    this.l2CallRegistry = registry;
+    console.log(`  L2CallRegistry deployed at: ${this.l2CallRegistryAddress}`);
+
+    // Deploy L1SenderProxyL2Factory
+    const factoryArtifact = getContractArtifact("L1SenderProxyL2Factory");
+    const factoryFactory = new ContractFactory(
+      factoryArtifact.abi,
+      factoryArtifact.bytecode,
+      systemSigner
+    );
+    const factory = await factoryFactory.deploy(L2_SYSTEM_ADDRESS, this.l2CallRegistryAddress);
+    await factory.waitForDeployment();
+    this.l2ProxyFactoryAddress = await factory.getAddress();
+    this.l2ProxyFactory = new Contract(
+      this.l2ProxyFactoryAddress,
+      L2_PROXY_FACTORY_ABI,
+      systemSigner
+    );
+    console.log(`  L1SenderProxyL2Factory deployed at: ${this.l2ProxyFactoryAddress}`);
+
+    await this.l2Provider.send("anvil_stopImpersonatingAccount", [L2_SYSTEM_ADDRESS]);
+  }
+
+  /**
+   * Ensure L1 caller has a proxy on L2
+   */
+  private async ensureL2Proxy(l1Address: string): Promise<string> {
+    const isDeployed = await this.l2ProxyFactory!.isProxyDeployed(l1Address);
+
+    if (isDeployed) {
+      return await this.l2ProxyFactory!.getProxy(l1Address);
+    }
+
+    console.log(`  Deploying L2 proxy for L1 address ${l1Address}...`);
+
+    await this.l2Provider.send("anvil_impersonateAccount", [L2_SYSTEM_ADDRESS]);
+    const systemSigner = await this.l2Provider.getSigner(L2_SYSTEM_ADDRESS);
+
+    const factoryWithSigner = this.l2ProxyFactory!.connect(systemSigner) as Contract;
+    const tx = await factoryWithSigner.deployProxy(l1Address);
+    await tx.wait();
+
+    await this.l2Provider.send("anvil_stopImpersonatingAccount", [L2_SYSTEM_ADDRESS]);
+
+    const proxyAddress = await this.l2ProxyFactory!.getProxy(l1Address);
+    console.log(`  L2 proxy deployed at: ${proxyAddress}`);
+
+    return proxyAddress;
   }
 
   /**
@@ -194,20 +317,27 @@ export class L2Fullnode {
       isSynced: l2BlockHash.toLowerCase() === l2Block?.stateRoot?.toLowerCase(),
       processedL2Blocks: this.processedL2Blocks.size,
       processedIncomingCalls: this.processedIncomingCalls.size,
+      l2ProxyFactoryAddress: this.l2ProxyFactoryAddress,
+      l2CallRegistryAddress: this.l2CallRegistryAddress,
     };
   }
 
   /**
-   * Start the fullnode - spawn L2, sync past events and watch for new ones
+   * Start the fullnode
    */
   async start(): Promise<void> {
     console.log("=== Native Rollup L2 Fullnode ===");
     console.log(`L1 RPC: ${this.config.l1Rpc}`);
     console.log(`NativeRollupCore: ${this.config.rollupAddress}`);
+    console.log(`L2 System Address: ${L2_SYSTEM_ADDRESS}`);
     console.log("");
 
-    // Spawn a fresh L2 Anvil instance
+    // Spawn L2 Anvil with system address pre-funded
     await this.spawnL2Anvil();
+
+    // Deploy L2 infrastructure (MUST match builder)
+    await this.deployL2Infrastructure();
+
     console.log("");
 
     // Get current L2 state from L1
@@ -218,10 +348,10 @@ export class L2Fullnode {
     console.log(`  Synced:       ${status.isSynced ? "YES" : "NO"}`);
     console.log("");
 
-    // Sync past events first
+    // Sync past events
     await this.syncPastEvents();
 
-    // Start watching for new events
+    // Watch for new events
     this.watchEvents();
 
     console.log("Fullnode running, watching for L1 events...");
@@ -253,6 +383,16 @@ export class L2Fullnode {
       await this.handleIncomingCallHandled(event);
     }
 
+    // Get all past L2TransactionProcessed events
+    const txFilter = this.rollupCore.filters.L2TransactionProcessed();
+    const txEvents = await this.rollupCore.queryFilter(txFilter);
+
+    console.log(`Found ${txEvents.length} L2TransactionProcessed events`);
+
+    for (const event of txEvents) {
+      await this.handleL2TransactionProcessed(event);
+    }
+
     console.log("Past events synced.");
   }
 
@@ -260,17 +400,9 @@ export class L2Fullnode {
    * Watch for new L1 events
    */
   private watchEvents(): void {
-    // Watch for L2BlockProcessed
     this.rollupCore.on(
       "L2BlockProcessed",
-      async (
-        blockNumber: bigint,
-        prevBlockHash: string,
-        newBlockHash: string,
-        outgoingCallsCount: bigint,
-        event: any
-      ) => {
-        // For live events, event is a ContractEventPayload with log property
+      async (blockNumber: bigint, prevBlockHash: string, newBlockHash: string, outgoingCallsCount: bigint, event: any) => {
         await this.handleL2BlockProcessed({
           args: [blockNumber, prevBlockHash, newBlockHash, outgoingCallsCount],
           transactionHash: event.log?.transactionHash,
@@ -279,20 +411,22 @@ export class L2Fullnode {
       }
     );
 
-    // Watch for IncomingCallHandled
     this.rollupCore.on(
       "IncomingCallHandled",
-      async (
-        l2Address: string,
-        responseKey: string,
-        outgoingCallsCount: bigint,
-        value: bigint,
-        event: any
-      ) => {
-        // For live events, event is a ContractEventPayload with log property
-        // Pass the raw args and log info
+      async (l2Address: string, responseKey: string, outgoingCallsCount: bigint, value: bigint, event: any) => {
         await this.handleIncomingCallHandled({
           args: [l2Address, responseKey, outgoingCallsCount, value],
+          transactionHash: event.log?.transactionHash,
+          log: event.log,
+        });
+      }
+    );
+
+    this.rollupCore.on(
+      "L2TransactionProcessed",
+      async (blockNumber: bigint, txHash: string, from: string, newStateHash: string, event: any) => {
+        await this.handleL2TransactionProcessed({
+          args: [blockNumber, txHash, from, newStateHash],
           transactionHash: event.log?.transactionHash,
           log: event.log,
         });
@@ -307,7 +441,7 @@ export class L2Fullnode {
     const blockNum = Number(event.args[0]);
 
     if (this.processedL2Blocks.has(blockNum)) {
-      return; // Already processed
+      return;
     }
 
     this.processedL2Blocks.add(blockNum);
@@ -315,11 +449,9 @@ export class L2Fullnode {
     console.log(`Processing L2 block ${blockNum}...`);
 
     try {
-      // Get the L1 transaction
       const tx = await this.l1Provider.getTransaction(event.transactionHash);
       if (!tx) throw new Error(`Transaction ${event.transactionHash} not found`);
 
-      // Decode processCallOnL2 parameters
       const decoded = this.rollupCore.interface.parseTransaction({
         data: tx.data,
         value: tx.value,
@@ -329,7 +461,6 @@ export class L2Fullnode {
 
       const callData: string = decoded.args[1];
 
-      // Execute the L2 transaction if there's calldata
       if (callData && callData !== "0x" && callData.length > 2) {
         await this.executeL2Transaction(callData);
       }
@@ -350,11 +481,11 @@ export class L2Fullnode {
   private async handleIncomingCallHandled(event: any): Promise<void> {
     const l2Address = event.args[0];
     const responseKey = event.args[1];
-    const value = BigInt(event.args[3] || 0); // value is the 4th argument
+    const value = BigInt(event.args[3] || 0);
     const txHash = event.transactionHash;
 
     if (this.processedIncomingCalls.has(responseKey)) {
-      return; // Already processed
+      return;
     }
 
     this.processedIncomingCalls.add(responseKey);
@@ -365,21 +496,21 @@ export class L2Fullnode {
     }
 
     try {
-      // Try to get transaction details if we have hash
+      // Find the L1 caller and calldata from registration
       let l1Caller: string | null = null;
       let callData: string = "0x";
 
       if (txHash) {
         const tx = await this.l1Provider.getTransaction(txHash);
         if (tx) {
-          // The L1 caller is the tx.from (the account that called the proxy)
           l1Caller = tx.from;
-          // For direct proxy calls, data would be in tx.data, but we need registration data
-          callData = await this.findCallDataFromRegistration(l2Address, responseKey) || "0x";
+          const regInfo = await this.findRegistrationInfo(l2Address, responseKey);
+          if (regInfo) {
+            callData = regInfo.callData;
+          }
         }
       }
 
-      // Fallback: find L1 caller from registration event if we couldn't get it from tx
       if (!l1Caller) {
         const regInfo = await this.findRegistrationInfo(l2Address, responseKey);
         if (regInfo) {
@@ -388,20 +519,15 @@ export class L2Fullnode {
         }
       }
 
-      // If still no L1 caller, use a fallback for simple deposits
-      // In this case, we treat it as a deposit from a generic L1 address
       if (!l1Caller) {
-        console.log(`  Warning: Could not determine L1 caller, using generic deposit handler`);
-        // For deposits, we just need to credit the L2 address
-        await this.executeDirectDeposit(l2Address, value);
-        console.log(`  ✓ Deposit processed (direct)`);
+        console.log(`  Warning: Could not determine L1 caller`);
         return;
       }
 
       console.log(`  L1 Caller: ${l1Caller}`);
       console.log(`  L2 Target: ${l2Address}`);
 
-      // Execute the call on L2 with the value
+      // Execute the call using proxy system (matching builder)
       await this.executeL1ToL2Call(l1Caller, l2Address, value, callData);
 
       console.log(`  ✓ Incoming call processed`);
@@ -415,7 +541,91 @@ export class L2Fullnode {
   }
 
   /**
-   * Find registration info (L1 caller and calldata) from registration event
+   * Handle L2TransactionProcessed event
+   * This is the new primary mechanism for processing L2 transactions
+   */
+  private async handleL2TransactionProcessed(event: any): Promise<void> {
+    const blockNum = Number(event.args[0]);
+    const txHash = event.args[1];
+    const expectedStateHash = event.args[3];
+
+    if (this.processedL2Transactions.has(txHash)) {
+      return;
+    }
+
+    this.processedL2Transactions.add(txHash);
+
+    console.log(`Processing L2 transaction (block ${blockNum})...`);
+    console.log(`  Tx hash: ${txHash}`);
+
+    try {
+      // Get the L1 transaction that submitted this L2 tx
+      const l1Tx = await this.l1Provider.getTransaction(event.transactionHash);
+      if (!l1Tx) throw new Error(`L1 transaction ${event.transactionHash} not found`);
+
+      // Decode the L1 transaction to get the raw L2 transaction
+      const decoded = this.rollupCore.interface.parseTransaction({
+        data: l1Tx.data,
+        value: l1Tx.value,
+      });
+
+      if (!decoded || decoded.name !== "processL2Transaction") {
+        throw new Error(`Unexpected function: ${decoded?.name}`);
+      }
+
+      // Extract the raw L2 transaction bytes
+      const rawTransaction: string = decoded.args[0];
+      console.log(`  Raw L2 tx length: ${(rawTransaction.length - 2) / 2} bytes`);
+
+      // Parse the transaction to get sender
+      const parsedTx = ethers.Transaction.from(rawTransaction);
+      const sender = parsedTx.from;
+      console.log(`  Sender: ${sender}`);
+
+      // Fund the sender if needed (in a real system, this would come from prior deposits)
+      // For now, we ensure the sender has funds to execute
+      const senderBalance = await this.l2Provider.getBalance(sender!);
+      if (senderBalance === 0n) {
+        console.log(`  Funding sender for transaction execution...`);
+        await this.l2Provider.send("anvil_setBalance", [
+          sender,
+          "0x" + ethers.parseEther("100").toString(16),
+        ]);
+      }
+
+      // Submit the raw transaction to L2
+      const l2TxHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTransaction]);
+      console.log(`  L2 tx submitted: ${l2TxHash}`);
+
+      // Wait for it to be mined
+      const receipt = await this.l2Provider.waitForTransaction(l2TxHash);
+      console.log(`  L2 tx result: ${receipt?.status === 1 ? "success" : "reverted"}`);
+
+      // Verify state root matches expected
+      const l2Block = await this.l2Provider.getBlock("latest");
+      const actualStateRoot = l2Block?.stateRoot;
+
+      if (actualStateRoot?.toLowerCase() === expectedStateHash.toLowerCase()) {
+        console.log(`  ✓ State root matches!`);
+      } else {
+        console.log(`  ⚠ State root mismatch!`);
+        console.log(`    Expected: ${expectedStateHash}`);
+        console.log(`    Actual:   ${actualStateRoot}`);
+      }
+
+      console.log(`  ✓ L2 transaction processed`);
+
+      if (this.onL2TransactionProcessed) {
+        const parsedTx = ethers.Transaction.from(rawTransaction);
+        this.onL2TransactionProcessed(txHash, parsedTx.from || "unknown");
+      }
+    } catch (err: any) {
+      console.error(`  ✗ Failed to process L2 transaction:`, err.message);
+    }
+  }
+
+  /**
+   * Find registration info from L1 events
    */
   private async findRegistrationInfo(
     l2Address: string,
@@ -449,136 +659,27 @@ export class L2Fullnode {
   }
 
   /**
-   * Execute a direct deposit (when we can't determine L1 caller)
-   * Simply credits the L2 address with the value
-   */
-  private async executeDirectDeposit(l2Address: string, value: bigint): Promise<void> {
-    if (value === 0n) return;
-
-    // Just set the balance directly
-    const currentBalance = await this.l2Provider.getBalance(l2Address);
-    const newBalance = currentBalance + value;
-
-    await this.l2Provider.send("anvil_setBalance", [
-      l2Address,
-      "0x" + newBalance.toString(16),
-    ]);
-
-    console.log(`  Credited ${ethers.formatEther(value)} xDAI to ${l2Address}`);
-  }
-
-  /**
-   * Find calldata from the registration event
-   */
-  private async findCallDataFromRegistration(
-    l2Address: string,
-    responseKey: string
-  ): Promise<string | null> {
-    const filter = this.rollupCore.filters.IncomingCallRegistered(
-      l2Address,
-      null,
-      null
-    );
-    const events = await this.rollupCore.queryFilter(filter);
-
-    for (const event of events) {
-      if (event.args![3] === responseKey) {
-        const tx = await this.l1Provider.getTransaction(event.transactionHash);
-        if (tx) {
-          const decoded = this.rollupCore.interface.parseTransaction({
-            data: tx.data,
-            value: tx.value,
-          });
-          if (decoded && decoded.name === "registerIncomingCall") {
-            return decoded.args[2]; // callData parameter
-          }
-        }
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Find the L1 caller of the L2 proxy
-   */
-  private async findL1Caller(
-    txHash: string,
-    l2Address: string
-  ): Promise<string | null> {
-    const tx = await this.l1Provider.getTransaction(txHash);
-    if (!tx) return null;
-
-    const l2ProxyOnL1 = await this.rollupCore.getProxyAddress(l2Address);
-
-    // Try debug_traceTransaction first
-    try {
-      const trace = await this.l1Provider.send("debug_traceTransaction", [
-        txHash,
-        { tracer: "callTracer" },
-      ]);
-
-      const caller = this.findCallerOfAddress(trace, l2ProxyOnL1.toLowerCase());
-      if (caller) return caller;
-    } catch {
-      // Trace not available
-    }
-
-    // Fallback: infer from tx.to
-    if (tx.to && tx.to.toLowerCase() !== l2ProxyOnL1.toLowerCase()) {
-      return tx.to;
-    }
-
-    return tx.from;
-  }
-
-  /**
-   * Recursively search call trace for the caller of a specific address
-   */
-  private findCallerOfAddress(trace: any, targetAddress: string): string | null {
-    if (!trace) return null;
-
-    if (trace.calls) {
-      for (const call of trace.calls) {
-        if (call.to && call.to.toLowerCase() === targetAddress) {
-          return call.from;
-        }
-        const found = this.findCallerOfAddress(call, targetAddress);
-        if (found) return found;
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Execute an L2 transaction (from callData)
+   * Execute an L2 transaction from calldata
    */
   private async executeL2Transaction(callData: string): Promise<void> {
     try {
-      // Try as raw RLP-encoded transaction
-      const txHash = await this.l2Provider.send("eth_sendRawTransaction", [
-        callData,
-      ]);
+      const txHash = await this.l2Provider.send("eth_sendRawTransaction", [callData]);
       console.log(`  L2 tx submitted: ${txHash}`);
 
       const receipt = await this.l2Provider.waitForTransaction(txHash);
-      console.log(
-        `  L2 tx result: ${receipt?.status === 1 ? "success" : "reverted"}`
-      );
+      console.log(`  L2 tx result: ${receipt?.status === 1 ? "success" : "reverted"}`);
     } catch (err: any) {
-      // Not a raw transaction - might be arbitrary calldata
       console.log(`  Note: callData is not raw RLP transaction`);
     }
   }
 
   /**
-   * Execute an L1→L2 call by impersonating the L1 caller's proxy on L2
+   * Execute an L1→L2 call using the proxy system (MUST match builder)
    *
-   * For deposits (value > 0), the value is "minted" on L2 by adding it to the
-   * proxy's balance. This is deterministic because:
-   * - The value comes from the L1 event
-   * - The proxy address is deterministic
+   * Flow:
+   * 1. Ensure L1 caller has proxy on L2
+   * 2. System address calls proxy with (target + calldata)
+   * 3. Proxy forwards to target
    */
   private async executeL1ToL2Call(
     l1Caller: string,
@@ -586,43 +687,28 @@ export class L2Fullnode {
     value: bigint,
     data: string
   ): Promise<void> {
-    const l2ProxyOfL1Caller = computeL2ProxyAddress(l1Caller);
+    // Ensure L1 caller has proxy on L2
+    const l1CallerL2Proxy = await this.ensureL2Proxy(l1Caller);
+    console.log(`  L1 caller's L2 proxy: ${l1CallerL2Proxy}`);
 
-    console.log(`  L2 proxy of L1 caller: ${l2ProxyOfL1Caller}`);
+    // System address calls the proxy
+    await this.l2Provider.send("anvil_impersonateAccount", [L2_SYSTEM_ADDRESS]);
+    const systemSigner = await this.l2Provider.getSigner(L2_SYSTEM_ADDRESS);
 
-    // Impersonate the proxy on L2
-    await this.l2Provider.send("anvil_impersonateAccount", [l2ProxyOfL1Caller]);
+    // Encode the call: target address (20 bytes) + calldata
+    const proxyCallData = ethers.concat([l2Target, data || "0x"]);
 
-    // Get current balance
-    const currentBalance = await this.l2Provider.getBalance(l2ProxyOfL1Caller);
-
-    // Add value (deposit) + gas allowance to the balance
-    // The deposited value is "minted" deterministically from L1 event
-    const gasAllowance = ethers.parseEther("0.1");
-    const newBalance = currentBalance + value + gasAllowance;
-
-    await this.l2Provider.send("anvil_setBalance", [
-      l2ProxyOfL1Caller,
-      "0x" + newBalance.toString(16),
-    ]);
-
-    // Execute the call (transfers value to l2Target)
-    const signer = await this.l2Provider.getSigner(l2ProxyOfL1Caller);
-    const tx = await signer.sendTransaction({
-      to: l2Target,
+    // System calls the proxy, which forwards to target
+    const tx = await systemSigner.sendTransaction({
+      to: l1CallerL2Proxy,
+      data: proxyCallData,
       value,
-      data,
     });
-
     const receipt = await tx.wait();
-    console.log(
-      `  L2 call result: ${receipt?.status === 1 ? "success" : "reverted"}`
-    );
 
-    // Stop impersonating
-    await this.l2Provider.send("anvil_stopImpersonatingAccount", [
-      l2ProxyOfL1Caller,
-    ]);
+    await this.l2Provider.send("anvil_stopImpersonatingAccount", [L2_SYSTEM_ADDRESS]);
+
+    console.log(`  L2 call result: ${receipt?.status === 1 ? "success" : "reverted"}`);
   }
 
   /**
@@ -640,7 +726,7 @@ export class L2Fullnode {
   }
 
   /**
-   * Stop the fullnode and kill the Anvil process
+   * Stop the fullnode
    */
   stop(): void {
     this.rollupCore.removeAllListeners();
@@ -655,7 +741,7 @@ export class L2Fullnode {
   }
 
   /**
-   * Get the L2 RPC URL (for external access to the L2 chain)
+   * Get the L2 RPC URL
    */
   getL2Rpc(): string {
     return `http://localhost:${this.config.l2Port}`;
@@ -685,8 +771,6 @@ async function main() {
   });
 }
 
-// Check if run directly via import.meta.url
-const isMainModule = import.meta.url.endsWith(process.argv[1]?.replace(/^file:\/\//, '') || '');
 if (process.argv[1]?.includes('fullnode')) {
   main().catch((err) => {
     console.error("Fullnode error:", err);

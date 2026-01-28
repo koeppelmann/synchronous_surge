@@ -67,7 +67,7 @@ contract L2SenderProxy {
     receive() external payable {
         // Forward the ETH transfer to NativeRollupCore
         // This will revert with IncomingCallNotRegistered if not pre-announced
-        INativeRollupCore(nativeRollup).handleIncomingCall{value: msg.value}(l2Address, "");
+        INativeRollupCore(nativeRollup).handleIncomingCall{value: msg.value}(l2Address, msg.sender, "");
     }
 
     /// @notice Handle incoming calls to this L2 address
@@ -76,8 +76,9 @@ contract L2SenderProxy {
     /// @return The pre-registered return value
     fallback(bytes calldata) external payable returns (bytes memory) {
         // Forward the incoming call and value to NativeRollupCore
+        // msg.sender is the L1 contract that called this proxy
         // This will revert with IncomingCallNotRegistered if not pre-announced
-        return INativeRollupCore(nativeRollup).handleIncomingCall{value: msg.value}(l2Address, msg.data);
+        return INativeRollupCore(nativeRollup).handleIncomingCall{value: msg.value}(l2Address, msg.sender, msg.data);
     }
 }
 
@@ -85,6 +86,7 @@ contract L2SenderProxy {
 interface INativeRollupCore {
     function handleIncomingCall(
         address l2Address,
+        address l1Caller,
         bytes calldata callData
     ) external payable returns (bytes memory);
 }

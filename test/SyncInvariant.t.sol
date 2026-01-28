@@ -195,7 +195,7 @@ contract SyncInvariantTest is Test {
 
         // This would "succeed" in updating L2 state, but L1 is not synced
         // An HONEST prover would NEVER sign this proof for a synced counter
-        rollup.processCallOnL2(currentState, callData, newState, calls, results, newState, proof);
+        rollup.processSingleTxOnL2(currentState, callData, newState, calls, results, newState, proof);
 
         // L2 updated but L1 didn't - this is the trust assumption violation
         trueL2Value = newValue;
@@ -281,7 +281,7 @@ contract SyncInvariantTest is Test {
         bytes32 newState = _computeState(newValue);
         bytes memory proof = _signProof(currentState, callData, currentState, calls, results, newState);
 
-        rollup.processCallOnL2(currentState, callData, currentState, calls, results, newState, proof);
+        rollup.processSingleTxOnL2(currentState, callData, currentState, calls, results, newState, proof);
         trueL2Value = newValue;
     }
 
@@ -336,7 +336,7 @@ contract SyncInvariantTest is Test {
         results[0] = abi.encode(uint256(0));
 
         bytes memory proof = _signProof(GENESIS_HASH, callData, GENESIS_HASH, calls, results, GENESIS_HASH);
-        rollup.processCallOnL2(GENESIS_HASH, callData, GENESIS_HASH, calls, results, GENESIS_HASH, proof);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData, GENESIS_HASH, calls, results, GENESIS_HASH, proof);
     }
 
     function _computeState(uint256 value) internal pure returns (bytes32) {

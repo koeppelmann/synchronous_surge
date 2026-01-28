@@ -89,7 +89,7 @@ contract SyncedCounterTest is Test {
 
         bytes memory proof = _signProof(GENESIS_HASH, callData, postExecState, calls, results, finalState);
 
-        rollup.processCallOnL2(GENESIS_HASH, callData, postExecState, calls, results, finalState, proof);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData, postExecState, calls, results, finalState, proof);
 
         // Verify sync: L1 counter should have the new value
         assertEq(l1Counter.value(), newValue, "L1 counter not synced");
@@ -122,7 +122,7 @@ contract SyncedCounterTest is Test {
 
             bytes memory proof = _signProof(currentState, callData, postExecState, calls, results, finalState);
 
-            rollup.processCallOnL2(currentState, callData, postExecState, calls, results, finalState, proof);
+            rollup.processSingleTxOnL2(currentState, callData, postExecState, calls, results, finalState, proof);
 
             currentState = finalState;
             l2CounterValue = i * 10;
@@ -154,7 +154,7 @@ contract SyncedCounterTest is Test {
 
         // This succeeds but leaves values out of sync!
         // The admin should NEVER sign such a proof for synced contracts
-        rollup.processCallOnL2(GENESIS_HASH, callData, postExecState, calls, results, finalState, proof);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData, postExecState, calls, results, finalState, proof);
 
         // Values are now out of sync - this is the vulnerability if admin signs bad proofs
         l2CounterValue = newValue;
@@ -195,7 +195,7 @@ contract SyncedCounterTest is Test {
         results1[0] = abi.encode(uint256(50));
         bytes32 state1 = _computeL2StateHash(50);
         bytes memory proof1 = _signProof(GENESIS_HASH, callData1, state1, calls1, results1, state1);
-        rollup.processCallOnL2(GENESIS_HASH, callData1, state1, calls1, results1, state1, proof1);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData1, state1, calls1, results1, state1, proof1);
 
         // Then sync to value 100
         bytes memory callData2 = abi.encodeCall(L2SyncedCounter.setValue, (100));
@@ -212,7 +212,7 @@ contract SyncedCounterTest is Test {
         results2[0] = abi.encode(uint256(100));
         bytes32 state2 = _computeL2StateHash(100);
         bytes memory proof2 = _signProof(state1, callData2, state2, calls2, results2, state2);
-        rollup.processCallOnL2(state1, callData2, state2, calls2, results2, state2, proof2);
+        rollup.processSingleTxOnL2(state1, callData2, state2, calls2, results2, state2, proof2);
 
         assertEq(l1Counter.value(), 100, "Value should be 100");
 
@@ -224,7 +224,7 @@ contract SyncedCounterTest is Test {
                 GENESIS_HASH
             )
         );
-        rollup.processCallOnL2(GENESIS_HASH, callData1, state1, calls1, results1, state1, proof1);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData1, state1, calls1, results1, state1, proof1);
 
         assertEq(l1Counter.value(), 100, "Replay should have failed");
     }
@@ -250,7 +250,7 @@ contract SyncedCounterTest is Test {
         bytes32 state1 = _computeL2StateHash(value1);
         bytes memory proof1 = _signProof(GENESIS_HASH, callData1, state1, calls1, results1, state1);
 
-        rollup.processCallOnL2(GENESIS_HASH, callData1, state1, calls1, results1, state1, proof1);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData1, state1, calls1, results1, state1, proof1);
 
         // Second update with same prevBlockHash should fail
         bytes memory callData2 = abi.encodeCall(L2SyncedCounter.setValue, (value2));
@@ -275,7 +275,7 @@ contract SyncedCounterTest is Test {
                 GENESIS_HASH
             )
         );
-        rollup.processCallOnL2(GENESIS_HASH, callData2, state2, calls2, results2, state2, proof2);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData2, state2, calls2, results2, state2, proof2);
 
         assertEq(l1Counter.value(), value1, "Only first update should succeed");
     }
@@ -344,7 +344,7 @@ contract SyncedCounterTest is Test {
         results[0] = abi.encode(uint256(0));
 
         bytes memory proof = _signProof(GENESIS_HASH, callData, GENESIS_HASH, calls, results, GENESIS_HASH);
-        rollup.processCallOnL2(GENESIS_HASH, callData, GENESIS_HASH, calls, results, GENESIS_HASH, proof);
+        rollup.processSingleTxOnL2(GENESIS_HASH, callData, GENESIS_HASH, calls, results, GENESIS_HASH, proof);
     }
 
     function _signProof(

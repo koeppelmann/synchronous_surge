@@ -663,7 +663,17 @@ async function processL1ContractCall(
   }
 
   // Get current L2 state from L1
-  const currentL2Hash = await rollupContract.l2BlockHash();
+  let currentL2Hash = await rollupContract.l2BlockHash();
+
+  // Step 0.5: Pre-register common function calls for hinted L2 addresses
+  // This allows the trace to succeed and discover all L2 calls
+  // Without this, the trace stops at the first unregistered call
+  if (l2Addresses && l2Addresses.length > 0) {
+    log("Builder", `  Pre-registering common calls for tracing...`);
+    await preRegisterL2Calls(l2Addresses, currentL2Hash, tx);
+    // Update currentL2Hash in case pre-registration changed state
+    currentL2Hash = await rollupContract.l2BlockHash();
+  }
   log("Builder", `  Current L2 hash: ${currentL2Hash}`);
 
   // Verify fullnode is synced
@@ -781,21 +791,19 @@ async function parseTraceForProxyCalls(
 ): Promise<DetectedProxyCall[]> {
   const calls: DetectedProxyCall[] = [];
 
-  async function traverse(node: any, caller: string) {
+  log("Builder", `    Parsing trace for proxy calls...`);
+
+  async function traverse(node: any, caller: string, depth: number = 0) {
     if (!node) return;
 
+    const indent = "  ".repeat(depth);
     const to = node.to?.toLowerCase();
+
     if (to) {
+      log("Builder", `    ${indent}Checking ${to.slice(0, 10)}... (input: ${(node.input || "0x").slice(0, 10)})`);
+
       // Check if this is a call to an L2SenderProxy
-      // L2SenderProxy contracts are deployed by NativeRollupCore
-      // They forward calls to handleIncomingCall
-
-      // Simple heuristic: check if the target has L2SenderProxy bytecode
-      // For POC, we'll check if the call eventually reaches handleIncomingCall
-
-      // Check if this address is a known proxy
       try {
-        // Try to get the l2Address from the proxy
         const proxyContract = new Contract(to, [
           "function l2Address() view returns (address)",
           "function nativeRollup() view returns (address)"
@@ -808,8 +816,8 @@ async function parseTraceForProxyCalls(
 
         if (l2Address && nativeRollup?.toLowerCase() === config.rollupAddress.toLowerCase()) {
           // This is an L2SenderProxy!
-          // The caller is the 'from' address of this node (the contract that made this call)
           const actualCaller = node.from?.toLowerCase() || caller;
+          log("Builder", `    ${indent}  -> PROXY DETECTED! l2Address=${l2Address}, caller=${actualCaller.slice(0, 10)}...`);
           calls.push({
             l2Address,
             proxyAddress: to,
@@ -818,20 +826,23 @@ async function parseTraceForProxyCalls(
             caller: actualCaller,
           });
         }
-      } catch {
+      } catch (err: any) {
         // Not a proxy, continue
+        log("Builder", `    ${indent}  -> Not a proxy (${err.message?.slice(0, 30)}...)`);
       }
     }
 
     // Traverse child calls
     if (node.calls && Array.isArray(node.calls)) {
+      log("Builder", `    ${indent}Traversing ${node.calls.length} child call(s)...`);
       for (const childCall of node.calls) {
-        await traverse(childCall, node.from || caller);
+        await traverse(childCall, node.from || caller, depth + 1);
       }
     }
   }
 
   await traverse(trace, originalCaller);
+  log("Builder", `    Found ${calls.length} proxy call(s) total`);
   return calls;
 }
 
@@ -956,68 +967,72 @@ async function simulateL2CallOnFullnode(
   const l1ProxyOnL2 = computeL1SenderProxyL2Address(l1Caller);
   log("Builder", `      L1's proxy on L2: ${l1ProxyOnL2}`);
 
-  // Check if L1SenderProxyL2 is deployed on L2 (outside snapshot - this is permanent)
+  // Check if L1SenderProxyL2 is deployed on L2
   const proxyCode = await fullnodeProvider.getCode(l1ProxyOnL2);
   if (proxyCode === "0x") {
     log("Builder", `      Deploying L1SenderProxyL2 on L2...`);
     await deployL1SenderProxyL2OnL2(l1Caller, l1ProxyOnL2);
   }
 
-  // Create snapshot so we can revert after simulation
-  const snapshotId = await fullnodeProvider.send("evm_snapshot", []);
-  log("Builder", `      Created snapshot: ${snapshotId}`);
+  // IMPORTANT: We execute DIRECTLY on fullnode without reverting.
+  // This is a workaround for Anvil's non-deterministic state roots.
+  //
+  // In a production system with a deterministic EVM:
+  // - Builder would simulate with snapshot/revert
+  // - Fullnode would independently replay and get the same state root
+  //
+  // With Anvil:
+  // - Same operations at different times produce different state roots
+  // - So we execute once on fullnode, register that state root
+  // - Fullnode sees event, checks if already at expected state, skips re-execution
+  //
+  // This violates "fullnode derives from L1 only" but works for POC.
 
   let newStateRoot: string;
 
-  try {
-    // For ETH transfers, credit the balance
-    if (value > 0n) {
-      const currentBalance = await fullnodeProvider.getBalance(l2Target);
-      const newBalance = currentBalance + value;
-      await fullnodeProvider.send("anvil_setBalance", [
-        l2Target,
-        "0x" + newBalance.toString(16),
-      ]);
-      log("Builder", `      Credited ${ethers.formatEther(value)} ETH`);
-    }
-
-    // For contract calls, execute through the proxy
-    if (callData && callData !== "0x") {
-      await fullnodeProvider.send("anvil_impersonateAccount", [l1ProxyOnL2]);
-      await fullnodeProvider.send("anvil_setBalance", [
-        l1ProxyOnL2,
-        "0x" + ethers.parseEther("1").toString(16),
-      ]);
-
-      try {
-        const txHash = await fullnodeProvider.send("eth_sendTransaction", [{
-          from: l1ProxyOnL2,
-          to: l2Target,
-          data: callData,
-          value: value > 0n ? "0x" + value.toString(16) : "0x0",
-          gas: "0x1000000",
-        }]);
-
-        const receipt = await fullnodeProvider.waitForTransaction(txHash);
-        log("Builder", `      L2 call executed: ${receipt?.status === 1 ? "SUCCESS" : "REVERTED"}`);
-      } finally {
-        await fullnodeProvider.send("anvil_stopImpersonatingAccount", [l1ProxyOnL2]);
-      }
-    }
-
-    // Mine a block to commit state changes
-    await fullnodeProvider.send("evm_mine", []);
-
-    // Get the new state root
-    newStateRoot = await getStateRoot(fullnodeProvider);
-    log("Builder", `      New state root: ${newStateRoot}`);
-
-  } finally {
-    // ALWAYS revert to snapshot so fullnode state is unchanged
-    // The fullnode will update when it sees the L1 event
-    await fullnodeProvider.send("evm_revert", [snapshotId]);
-    log("Builder", `      Reverted to snapshot`);
+  // For ETH transfers, credit the balance
+  if (value > 0n) {
+    const currentBalance = await fullnodeProvider.getBalance(l2Target);
+    const newBalance = currentBalance + value;
+    await fullnodeProvider.send("anvil_setBalance", [
+      l2Target,
+      "0x" + newBalance.toString(16),
+    ]);
+    log("Builder", `      Credited ${ethers.formatEther(value)} ETH`);
   }
+
+  // For contract calls, execute through the proxy
+  if (callData && callData !== "0x") {
+    await fullnodeProvider.send("anvil_impersonateAccount", [l1ProxyOnL2]);
+    await fullnodeProvider.send("anvil_setBalance", [
+      l1ProxyOnL2,
+      "0x" + ethers.parseEther("1").toString(16),
+    ]);
+
+    try {
+      const txHash = await fullnodeProvider.send("eth_sendTransaction", [{
+        from: l1ProxyOnL2,
+        to: l2Target,
+        data: callData,
+        value: value > 0n ? "0x" + value.toString(16) : "0x0",
+        gas: "0x1000000",
+      }]);
+
+      const receipt = await fullnodeProvider.waitForTransaction(txHash);
+      log("Builder", `      L2 call executed: ${receipt?.status === 1 ? "SUCCESS" : "REVERTED"}`);
+    } finally {
+      await fullnodeProvider.send("anvil_stopImpersonatingAccount", [l1ProxyOnL2]);
+    }
+  }
+
+  // Mine a block to commit state changes
+  await fullnodeProvider.send("evm_mine", []);
+
+  // Get the new state root - this is now the ACTUAL fullnode state
+  newStateRoot = await getStateRoot(fullnodeProvider);
+  log("Builder", `      New state root: ${newStateRoot}`);
+
+  // NO REVERT - state persists on fullnode
 
   // Register on L1
   await registerIncomingCallResponse(l2Target, currentL2Hash, callData, newStateRoot);

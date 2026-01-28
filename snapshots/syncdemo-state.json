@@ -1,0 +1,28 @@
+{
+  "description": "L1 state with SyncDemo deployed and initialized",
+  "timestamp": "2026-01-28",
+  "l1Block": "0x1d",
+  "snapshotId": "0x1",
+  "contracts": {
+    "rollup": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+    "l1SyncedCounter": "0x663F3ad617193148711d28f5334eE4Ed07016602",
+    "l2SenderProxy": "0xc5AdD61254C6CB1dA0929A571A5D13B1EaC36281",
+    "syncDemo": "0x610178dA211FEF7D417bC0e6FeD39F05609AD788"
+  },
+  "l2Contracts": {
+    "l2SyncedCounter": "0x663F3ad617193148711d28f5334eE4Ed07016602",
+    "l1SenderProxyL2": "0xDe97FBEFdcd9345095fe852bdd8459f8F5517648",
+    "l2CallRegistry": "0xF2E246BB76DF876Cef8b38ae84130F4F55De395b",
+    "l1SenderProxyL2Factory": "0x2946259E0334f33A064106302415aD3391BeD384"
+  },
+  "state": {
+    "l2BlockHash": "0x3b3a6348ab12dc4045f85e6dc020a1aa95afb253f5d0eb3ecf440fc8fcffc822",
+    "l2BlockNumber": 6,
+    "counterValue": 66
+  },
+  "notes": {
+    "l2SenderProxy": "L1 contract that routes calls TO L2SyncedCounter. Used by L1SyncedCounter and SyncDemo to call/read L2.",
+    "l1SenderProxyL2": "L2 contract that represents L1SyncedCounter ON L2. msg.sender when L1 calls L2.",
+    "syncDemo": "Demo contract that reads L2 value, sets L1 value (which syncs to L2), then reads L2 again to verify sync."
+  }
+}

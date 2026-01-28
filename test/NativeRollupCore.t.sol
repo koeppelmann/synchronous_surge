@@ -69,7 +69,7 @@ contract NativeRollupCoreTest is Test {
         assertEq(rollup.l2BlockHash(), GENESIS_HASH);
     }
 
-    // ============ processCallOnL2 Tests ============
+    // ============ processSingleTxOnL2 Tests ============
 
     function test_ProcessCallOnL2_SimpleTransition() public {
         bytes memory callData = abi.encode("simple transition");
@@ -85,7 +85,7 @@ contract NativeRollupCoreTest is Test {
             STATE_1  // finalStateHash same as postExecutionStateHash when no calls
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -128,7 +128,7 @@ contract NativeRollupCoreTest is Test {
             STATE_2  // Final state after all processing
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -194,7 +194,7 @@ contract NativeRollupCoreTest is Test {
             STATE_2  // finalStateHash (different from postCallStateHash of last call)
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -235,7 +235,7 @@ contract NativeRollupCoreTest is Test {
 
         uint256 user2BalanceBefore = user2.balance;
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -270,7 +270,7 @@ contract NativeRollupCoreTest is Test {
             )
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             STATE_1,
             callData,
             STATE_2,
@@ -299,7 +299,7 @@ contract NativeRollupCoreTest is Test {
 
         vm.expectRevert(NativeRollupCore.ProofVerificationFailed.selector);
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -344,7 +344,7 @@ contract NativeRollupCoreTest is Test {
             )
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -382,7 +382,7 @@ contract NativeRollupCoreTest is Test {
 
         vm.expectRevert();  // UnexpectedCallResult
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -395,7 +395,7 @@ contract NativeRollupCoreTest is Test {
 
     function test_RevertWhen_Reentrancy() public {
         // This test verifies reentrancy protection
-        // The mockL1Callback will try to call processCallOnL2 during execution
+        // The mockL1Callback will try to call processSingleTxOnL2 during execution
         bytes memory callData = abi.encode("reentrancy test");
 
         OutgoingCall[] memory calls = new OutgoingCall[](1);
@@ -423,7 +423,7 @@ contract NativeRollupCoreTest is Test {
         // The call should fail due to reentrancy guard
         vm.expectRevert();
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -473,7 +473,7 @@ contract NativeRollupCoreTest is Test {
             STATE_1
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -512,7 +512,7 @@ contract NativeRollupCoreTest is Test {
             STATE_1
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -632,7 +632,7 @@ contract NativeRollupCoreTest is Test {
             STATE_2
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -681,7 +681,7 @@ contract NativeRollupCoreTest is Test {
             )
         );
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -733,9 +733,9 @@ contract NativeRollupCoreTest is Test {
         );
 
         vm.expectEmit(true, true, true, true);
-        emit NativeRollupCore.L2BlockProcessed(1, GENESIS_HASH, STATE_1, 0);
+        emit NativeRollupCore.L2BlockProcessed(1, GENESIS_HASH, STATE_1, callData, calls, results);
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -763,7 +763,7 @@ contract NativeRollupCoreTest is Test {
         vm.expectEmit(true, true, true, true);
         emit NativeRollupCore.L2StateUpdated(1, STATE_1, 0);
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -804,7 +804,7 @@ contract NativeRollupCoreTest is Test {
         vm.expectEmit(true, true, false, false);
         emit NativeRollupCore.L2SenderProxyDeployed(L2_ALICE, expectedProxy);
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             GENESIS_HASH,
             callData,
             STATE_1,
@@ -968,11 +968,11 @@ contract MockL1Callback {
     }
 
     function triggerReentrancy() external {
-        // Try to call processCallOnL2 during execution - should fail
+        // Try to call processSingleTxOnL2 during execution - should fail
         OutgoingCall[] memory calls = new OutgoingCall[](0);
         bytes[] memory results = new bytes[](0);
 
-        rollup.processCallOnL2(
+        rollup.processSingleTxOnL2(
             rollup.l2BlockHash(),
             "",
             keccak256("reentrant"),
