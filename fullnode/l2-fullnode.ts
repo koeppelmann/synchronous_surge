@@ -34,6 +34,7 @@ import {
   ContractFactory,
   JsonRpcProvider,
   Wallet,
+  Transaction,
 } from "ethers";
 import { spawn, ChildProcess } from "child_process";
 import * as http from "http";
@@ -94,6 +95,8 @@ const L1_SENDER_PROXY_L2_ABI = [
 const L2_CALL_REGISTRY_ABI = [
   "function registerReturnValue(bytes32 callKey, bytes calldata returnData)",
   "function getReturnValue(bytes32 callKey) view returns (bool registered, bytes memory returnData)",
+  "function clearReturnValues(bytes32[] calldata callKeys)",
+  "function isRegistered(bytes32 callKey) view returns (bool)",
 ];
 
 // L1 NativeRollupCore ABI (for watching events)
@@ -471,6 +474,21 @@ export class L2Fullnode implements IFullnodeRpc {
       case "nativerollup_verifyStateChain":
         return this.nativerollup_verifyStateChain(params[0]);
 
+      case "nativerollup_registerL2OutgoingCallResult":
+        return this.nativerollup_registerL2OutgoingCallResult(params[0]);
+
+      case "nativerollup_executeL2TransactionWithOutgoingCalls":
+        return this.nativerollup_executeL2TransactionWithOutgoingCalls(params[0], params[1], params[2]);
+
+      case "nativerollup_detectL2OutgoingCalls":
+        return this.nativerollup_detectL2OutgoingCalls(params[0]);
+
+      case "nativerollup_detectOutgoingCallsFromL1ToL2Call":
+        return this.nativerollup_detectOutgoingCallsFromL1ToL2Call(params[0]);
+
+      case "nativerollup_executeL1ToL2CallWithOutgoingCalls":
+        return this.nativerollup_executeL1ToL2CallWithOutgoingCalls(params[0], params[1], params[2]);
+
       default:
         throw new Error(`Unknown method: ${method}`);
     }
@@ -611,6 +629,504 @@ export class L2Fullnode implements IFullnodeRpc {
 
   async nativerollup_isL1SenderProxyL2Deployed(l1Address: string): Promise<boolean> {
     return this.l1ProxyAddresses.has(l1Address.toLowerCase());
+  }
+
+  /**
+   * Register a return value in L2CallRegistry for an L2→L1 outgoing call.
+   * This must be called BEFORE executing the L2 tx that makes the outgoing call.
+   *
+   * The callKey is: keccak256(abi.encodePacked(l1Address, l2Caller, callData))
+   * where l1Address is the actual L1 contract, l2Caller is the L2 contract calling,
+   * and callData is the function selector + args sent to the L1 proxy.
+   *
+   * @param l1Address The L1 contract address being called (the L1SenderProxyL2's l1Address)
+   * @param l2Caller The L2 contract making the outgoing call
+   * @param callData The calldata sent to the proxy (function selector + args)
+   * @param returnData The pre-computed return data from the L1 call
+   */
+  async nativerollup_registerL2OutgoingCallResult(params: {
+    l1Address: string;
+    l2Caller: string;
+    callData: string;
+    returnData: string;
+  }): Promise<{ callKey: string; txHash: string }> {
+    log("Fullnode", `Registering L2→L1 outgoing call result:`);
+    log("Fullnode", `  L1 address: ${params.l1Address}`);
+    log("Fullnode", `  L2 caller: ${params.l2Caller}`);
+    log("Fullnode", `  Calldata: ${params.callData.slice(0, 10)}...`);
+    log("Fullnode", `  Return data: ${(params.returnData || "0x").slice(0, 42)}...`);
+
+    // Compute the call key (must match L1SenderProxyL2.fallback)
+    const callKey = ethers.keccak256(
+      ethers.solidityPacked(
+        ["address", "address", "bytes"],
+        [params.l1Address, params.l2Caller, params.callData]
+      )
+    );
+    log("Fullnode", `  Call key: ${callKey}`);
+
+    // Register in L2CallRegistry via system address
+    if (!this.l2CallRegistryAddress) {
+      throw new Error("L2CallRegistry not deployed");
+    }
+
+    const registry = new Contract(
+      this.l2CallRegistryAddress,
+      L2_CALL_REGISTRY_ABI,
+      this.systemWallet
+    );
+
+    // Check if already registered
+    const alreadyRegistered = await registry.isRegistered(callKey);
+    if (alreadyRegistered) {
+      log("Fullnode", `  Already registered, skipping`);
+      return { callKey, txHash: "0x0" };
+    }
+
+    const nonce = await this.l2Provider.send("eth_getTransactionCount", [
+      this.systemWallet.address, "pending"
+    ]);
+    const tx = await registry.registerReturnValue(
+      callKey,
+      params.returnData || "0x",
+      { nonce: parseInt(nonce, 16) }
+    );
+
+    // Mine the registration tx
+    await this.l2Provider.send("evm_mine", []);
+    const receipt = await tx.wait();
+
+    log("Fullnode", `  Registered! TX: ${receipt?.hash}`);
+
+    return { callKey, txHash: receipt?.hash || "" };
+  }
+
+  /**
+   * Execute an L2 transaction that has outgoing L1 calls.
+   *
+   * This method:
+   * 1. Pre-registers each outgoing call's return value in L2CallRegistry
+   * 2. Executes the L2 transaction
+   * 3. Returns the execution result
+   *
+   * Used by both:
+   * - The builder (on its private fullnode during simulation)
+   * - The read-only fullnode (during L1 event replay)
+   *
+   * @param rawTx The RLP-encoded signed L2 transaction
+   * @param outgoingCalls Array of outgoing call details (from, target, data, etc.)
+   * @param outgoingCallResults The return data for each outgoing call
+   */
+  async nativerollup_executeL2TransactionWithOutgoingCalls(
+    rawTx: string,
+    outgoingCalls: Array<{
+      from: string;   // L2 contract making the call
+      target: string; // L1 contract being called (via proxy)
+      data: string;   // Calldata to the L1 function
+    }>,
+    outgoingCallResults: string[]
+  ): Promise<ExecutionResult> {
+    log("Fullnode", `Executing L2 transaction with ${outgoingCalls.length} outgoing call(s)...`);
+
+    if (!this.l2CallRegistryAddress) {
+      throw new Error("L2CallRegistry not deployed");
+    }
+
+    const registry = new Contract(
+      this.l2CallRegistryAddress,
+      L2_CALL_REGISTRY_ABI,
+      this.systemWallet
+    );
+
+    // Step 1: Send all registration txs to the mempool (NO mining yet).
+    // The registration + L2 tx will all be mined in a single block
+    // to produce a deterministic state root.
+    let nonce = parseInt(
+      await this.l2Provider.send("eth_getTransactionCount", [
+        this.systemWallet.address, "pending"
+      ]), 16
+    );
+
+    for (let i = 0; i < outgoingCalls.length; i++) {
+      const call = outgoingCalls[i];
+      const result = outgoingCallResults[i] || "0x";
+
+      // Compute the call key (must match L1SenderProxyL2.fallback):
+      //   callKey = keccak256(l1Address, msg.sender, msg.data)
+      // where l1Address = call.target (L1 contract), msg.sender = call.from (L2 caller)
+      const callKey = ethers.keccak256(
+        ethers.solidityPacked(
+          ["address", "address", "bytes"],
+          [call.target, call.from, call.data]
+        )
+      );
+
+      log("Fullnode", `  Registering outgoing call ${i}: ${call.from} → ${call.target}`);
+      log("Fullnode", `    Calldata: ${call.data.slice(0, 10)}...`);
+      log("Fullnode", `    Return: ${result.slice(0, 42)}${result.length > 42 ? '...' : ''}`);
+      log("Fullnode", `    Call key: ${callKey}`);
+
+      // Check if already registered (e.g. from a previous failed attempt)
+      const alreadyRegistered = await registry.isRegistered(callKey);
+      if (alreadyRegistered) {
+        log("Fullnode", `    Already registered, skipping`);
+        continue;
+      }
+
+      // Send to mempool — do NOT mine yet
+      await registry.registerReturnValue(callKey, result, { nonce: nonce++ });
+      log("Fullnode", `    Registration tx sent (nonce ${nonce - 1})`);
+    }
+
+    // Step 2: Send the L2 user tx to the mempool
+    log("Fullnode", `  Sending L2 tx to mempool...`);
+    const txHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTx]);
+    log("Fullnode", `  TX Hash: ${txHash}`);
+
+    // Step 3: Mine a single block containing ALL txs (registrations + user tx)
+    log("Fullnode", `  Mining single block with registrations + L2 tx...`);
+    await this.l2Provider.send("evm_mine", []);
+
+    // Get the receipt
+    const receipt = await this.l2Provider.getTransactionReceipt(txHash);
+    log("Fullnode", `  Receipt status: ${receipt?.status}`);
+
+    const newStateRoot = await this.nativerollup_getStateRoot();
+    log("Fullnode", `  New state root: ${newStateRoot}`);
+
+    // No cleanup needed — registered values are keyed by (l1Address, l2Caller, callData)
+    // and won't conflict with future calls unless the exact same call is made again,
+    // at which point they'll be consumed and new values registered.
+
+    return {
+      success: receipt?.status === 1,
+      txHash,
+      returnData: "0x",
+      newStateRoot,
+      gasUsed: (receipt?.gasUsed || 0n).toString(),
+      logs: [],
+      error: receipt?.status === 1 ? undefined : "L2 transaction reverted",
+    };
+  }
+
+  /**
+   * Detect outgoing L2→L1 calls in an L2 transaction by tracing it.
+   *
+   * Traces the transaction and looks for calls to L1SenderProxyL2 contracts
+   * from non-system addresses (which indicates an L2→L1 outgoing call).
+   *
+   * Returns the list of outgoing calls detected.
+   */
+  async nativerollup_detectL2OutgoingCalls(rawTx: string): Promise<Array<{
+    l2Caller: string;
+    proxyAddress: string;
+    l1Address: string;
+    callData: string;
+  }>> {
+    log("Fullnode", `Detecting L2→L1 outgoing calls...`);
+
+    // Parse the transaction to get from/to/data
+    const tx = Transaction.from(rawTx);
+    log("Fullnode", `  TX from: ${tx.from}, to: ${tx.to}`);
+
+    // Trace the transaction using debug_traceCall
+    let traceResult: any;
+    try {
+      traceResult = await this.l2Provider.send("debug_traceCall", [
+        {
+          from: tx.from,
+          to: tx.to,
+          data: tx.data,
+          value: tx.value ? ethers.toQuantity(tx.value) : "0x0",
+          gas: tx.gasLimit ? ethers.toQuantity(tx.gasLimit) : "0x1000000",
+        },
+        "latest",
+        { tracer: "callTracer", tracerConfig: { withLog: false } },
+      ]);
+    } catch (err: any) {
+      log("Fullnode", `  Trace failed: ${err.message}`);
+      // The tx might revert because outgoing calls are not registered yet
+      // Try to extract info from the revert
+      return [];
+    }
+
+    // Find calls to L1SenderProxyL2 contracts
+    const outgoingCalls: Array<{
+      l2Caller: string;
+      proxyAddress: string;
+      l1Address: string;
+      callData: string;
+    }> = [];
+
+    const findOutgoingCalls = async (call: any, depth: number = 0) => {
+      if (!call.to) return;
+
+      // Check if this call target is an L1SenderProxyL2
+      // We can check by looking at the factory's proxies mapping
+      // or by checking if the address has the L1SenderProxyL2 code pattern
+      const targetAddr = call.to.toLowerCase();
+
+      // Check if this is a known L1SenderProxyL2 by trying to read l1Address()
+      try {
+        const proxyContract = new Contract(
+          targetAddr,
+          L1_SENDER_PROXY_L2_ABI,
+          this.l2Provider
+        );
+        const l1Addr = await proxyContract.l1Address();
+        const sysAddr = await proxyContract.systemAddress();
+
+        // It's a proxy! Check if caller is NOT the system address
+        const callerAddr = (call.from || "").toLowerCase();
+        if (callerAddr !== sysAddr.toLowerCase()) {
+          // This is an L2→L1 outgoing call
+          log("Fullnode", `  Found outgoing call at depth ${depth}:`);
+          log("Fullnode", `    L2 caller: ${callerAddr}`);
+          log("Fullnode", `    Proxy: ${targetAddr}`);
+          log("Fullnode", `    L1 address: ${l1Addr}`);
+          log("Fullnode", `    Calldata: ${(call.input || "0x").slice(0, 10)}...`);
+
+          outgoingCalls.push({
+            l2Caller: callerAddr,
+            proxyAddress: targetAddr,
+            l1Address: l1Addr,
+            callData: call.input || "0x",
+          });
+        }
+      } catch {
+        // Not a proxy, continue
+      }
+
+      // Recurse into subcalls
+      if (call.calls) {
+        for (const subcall of call.calls) {
+          await findOutgoingCalls(subcall, depth + 1);
+        }
+      }
+    };
+
+    await findOutgoingCalls(traceResult);
+
+    log("Fullnode", `  Detected ${outgoingCalls.length} outgoing call(s)`);
+    return outgoingCalls;
+  }
+
+  /**
+   * Detect outgoing L2→L1 calls within an L1→L2 call.
+   * Traces the proxy call on L2 and finds calls to L1SenderProxyL2 contracts.
+   */
+  async nativerollup_detectOutgoingCallsFromL1ToL2Call(params: L1ToL2CallParams): Promise<Array<{
+    l2Caller: string;
+    proxyAddress: string;
+    l1Address: string;
+    callData: string;
+  }>> {
+    log("Fullnode", `Detecting outgoing L2→L1 calls within L1→L2 call...`);
+
+    // Get or deploy the proxy for the L1 caller (needed for tracing)
+    let proxyAddress = this.l1ProxyAddresses.get(params.l1Caller.toLowerCase());
+    if (!proxyAddress) {
+      // Deploy the proxy so we can trace through it
+      // The builder's outer snapshot will handle cleanup
+      proxyAddress = await this.deployL1SenderProxyL2(
+        params.l1Caller,
+        this.l2Provider,
+        this.systemWallet,
+        true  // Store in proxy cache so executeL1ToL2CallWithOutgoingCalls can find it
+      );
+      // Mine to include the deploy tx
+      await this.l2Provider.send("evm_mine", []);
+      log("Fullnode", `  Deployed temp proxy for ${params.l1Caller}: ${proxyAddress}`);
+    }
+
+    // Build the packed calldata (same as executeL1ToL2CallOnProvider)
+    const callData = params.callData || "0x";
+    const packedCalldata = ethers.solidityPacked(
+      ["address", "bytes"],
+      [params.l2Target, callData]
+    );
+
+    // Trace the call
+    let traceResult: any;
+    try {
+      traceResult = await this.l2Provider.send("debug_traceCall", [
+        {
+          from: this.systemWallet.address,
+          to: proxyAddress,
+          data: packedCalldata,
+          value: params.value ? ethers.toQuantity(BigInt(params.value)) : "0x0",
+          gas: "0x1000000",
+        },
+        "latest",
+        { tracer: "callTracer", tracerConfig: { withLog: false } },
+      ]);
+    } catch (err: any) {
+      log("Fullnode", `  Trace failed: ${err.message}`);
+      return [];
+    }
+
+    // Reuse the same detection logic as nativerollup_detectL2OutgoingCalls
+    const outgoingCalls: Array<{
+      l2Caller: string;
+      proxyAddress: string;
+      l1Address: string;
+      callData: string;
+    }> = [];
+
+    const findOutgoingCalls = async (call: any, depth: number = 0) => {
+      if (!call.to) return;
+      const targetAddr = call.to.toLowerCase();
+
+      try {
+        const proxyContract = new Contract(targetAddr, L1_SENDER_PROXY_L2_ABI, this.l2Provider);
+        const l1Addr = await proxyContract.l1Address();
+        const sysAddr = await proxyContract.systemAddress();
+
+        const callerAddr = (call.from || "").toLowerCase();
+        if (callerAddr !== sysAddr.toLowerCase()) {
+          log("Fullnode", `  Found outgoing call at depth ${depth}:`);
+          log("Fullnode", `    L2 caller: ${callerAddr}`);
+          log("Fullnode", `    Proxy: ${targetAddr}`);
+          log("Fullnode", `    L1 address: ${l1Addr}`);
+          log("Fullnode", `    Calldata: ${(call.input || "0x").slice(0, 10)}...`);
+
+          outgoingCalls.push({
+            l2Caller: callerAddr,
+            proxyAddress: targetAddr,
+            l1Address: l1Addr,
+            callData: call.input || "0x",
+          });
+        }
+      } catch {
+        // Not a proxy
+      }
+
+      if (call.calls) {
+        for (const subcall of call.calls) {
+          await findOutgoingCalls(subcall, depth + 1);
+        }
+      }
+    };
+
+    await findOutgoingCalls(traceResult);
+    log("Fullnode", `  Detected ${outgoingCalls.length} outgoing call(s) within L1→L2 call`);
+    return outgoingCalls;
+  }
+
+  /**
+   * Execute an L1→L2 call that contains outgoing L2→L1 calls.
+   * Pre-registers outgoing call results in L2CallRegistry, then executes the L1→L2 call.
+   */
+  async nativerollup_executeL1ToL2CallWithOutgoingCalls(
+    params: L1ToL2CallParams,
+    outgoingCalls: Array<{ from: string; target: string; data: string }>,
+    outgoingCallResults: string[]
+  ): Promise<ExecutionResult> {
+    log("Fullnode", `Executing L1→L2 call with ${outgoingCalls.length} outgoing call(s)...`);
+
+    if (!this.l2CallRegistryAddress) {
+      throw new Error("L2CallRegistry not deployed");
+    }
+
+    const registry = new Contract(
+      this.l2CallRegistryAddress,
+      L2_CALL_REGISTRY_ABI,
+      this.systemWallet
+    );
+
+    // Get or deploy proxy for L1 caller
+    let proxyAddress = this.l1ProxyAddresses.get(params.l1Caller.toLowerCase());
+    if (!proxyAddress) {
+      proxyAddress = await this.deployL1SenderProxyL2(
+        params.l1Caller,
+        this.l2Provider,
+        this.systemWallet,
+        true
+      );
+    }
+
+    // Build packed calldata
+    const callData = params.callData || "0x";
+    const packedCalldata = ethers.solidityPacked(
+      ["address", "bytes"],
+      [params.l2Target, callData]
+    );
+
+    // Get system nonce
+    let nonce = parseInt(
+      await this.l2Provider.send("eth_getTransactionCount", [
+        this.systemWallet.address, "pending"
+      ]), 16
+    );
+
+    // Step 1: Send all registration txs to mempool (NO mining yet)
+    for (let i = 0; i < outgoingCalls.length; i++) {
+      const call = outgoingCalls[i];
+      const result = outgoingCallResults[i] || "0x";
+
+      const callKey = ethers.keccak256(
+        ethers.solidityPacked(
+          ["address", "address", "bytes"],
+          [call.target, call.from, call.data]
+        )
+      );
+
+      log("Fullnode", `  Registering outgoing call ${i}: ${call.from} → ${call.target}`);
+      log("Fullnode", `    Call key: ${callKey}`);
+
+      const alreadyRegistered = await registry.isRegistered(callKey);
+      if (alreadyRegistered) {
+        log("Fullnode", `    Already registered, skipping`);
+        continue;
+      }
+
+      await registry.registerReturnValue(callKey, result, { nonce: nonce++ });
+    }
+
+    // Step 2: Send the L1→L2 proxy call to mempool
+    log("Fullnode", `  Sending L1→L2 proxy call (nonce: ${nonce})...`);
+    const txRequest = {
+      to: proxyAddress,
+      data: packedCalldata,
+      value: BigInt(params.value || "0"),
+      gasLimit: 10000000n,
+      nonce: nonce,
+    };
+    const tx = await this.systemWallet.sendTransaction(txRequest);
+
+    // Step 3: Mine single block with everything
+    await this.l2Provider.send("evm_mine", []);
+
+    const receipt = await tx.wait();
+    const newStateRoot = await this.nativerollup_getStateRoot();
+
+    log("Fullnode", `  Receipt status: ${receipt?.status}`);
+    log("Fullnode", `  New state root: ${newStateRoot}`);
+
+    // Capture return data
+    let returnData = "0x";
+    try {
+      returnData = await this.l2Provider.send("eth_call", [
+        {
+          from: this.systemWallet.address,
+          to: proxyAddress,
+          data: packedCalldata,
+          value: params.value ? ethers.toQuantity(BigInt(params.value)) : "0x0",
+        },
+        "latest",
+      ]);
+    } catch {
+      // state-changing call, return data not available via eth_call after state change
+    }
+
+    return {
+      success: receipt?.status === 1,
+      txHash: receipt?.hash || "",
+      returnData,
+      newStateRoot,
+      gasUsed: (receipt?.gasUsed || 0n).toString(),
+      logs: [],
+    };
   }
 
   /**
@@ -898,7 +1414,7 @@ export class L2Fullnode implements IFullnodeRpc {
       // Send deploy tx to mempool (caller is responsible for mining)
       // Use pending nonce to account for unmined txs in --no-mining mode
       const nonceHex = await provider.send("eth_getTransactionCount", [systemWallet.address, "pending"]);
-      const tx = await factory.deployProxy(l1Address, { nonce: parseInt(nonceHex, 16) });
+      const tx = await factory.deployProxy(l1Address, { nonce: parseInt(nonceHex, 16), gasLimit: 2000000n });
       log("Fullnode", `  L1SenderProxyL2 deploy tx sent for ${l1Address} → ${expectedAddress}`);
 
       // Only store the mapping if this is a canonical execution (not simulation)
@@ -1074,7 +1590,7 @@ export class L2Fullnode implements IFullnodeRpc {
       const prevState = await this.nativerollup_getStateRoot();
 
       if (type === "L2BlockProcessed") {
-        const { prevBlockHash, newBlockHash, rlpEncodedTx } = event.args;
+        const { prevBlockHash, newBlockHash, rlpEncodedTx, outgoingCalls: evtOutgoingCalls, outgoingCallResults: evtResults } = event.args;
 
         // Check if this event applies to our current state
         if (prevBlockHash.toLowerCase() !== prevState.toLowerCase()) {
@@ -1084,10 +1600,24 @@ export class L2Fullnode implements IFullnodeRpc {
         log("Fullnode", `  Replaying L2BlockProcessed from L1 #${blockNumber}`);
 
         if (rlpEncodedTx && rlpEncodedTx !== "0x") {
-          await this.nativerollup_executeL2Transaction(rlpEncodedTx);
+          // Check if there are outgoing calls that need pre-registration
+          if (evtOutgoingCalls && evtOutgoingCalls.length > 0) {
+            const calls = evtOutgoingCalls.map((c: any) => ({
+              from: c.from,
+              target: c.target,
+              data: c.data,
+            }));
+            const results = evtResults || [];
+            log("Fullnode", `    With ${calls.length} outgoing call(s)`);
+            await this.nativerollup_executeL2TransactionWithOutgoingCalls(
+              rlpEncodedTx, calls, results
+            );
+          } else {
+            await this.nativerollup_executeL2Transaction(rlpEncodedTx);
+          }
         }
       } else {
-        const { l2Address, l1Caller, prevBlockHash, callData, value, finalStateHash } = event.args;
+        const { l2Address, l1Caller, prevBlockHash, callData, value, outgoingCalls: evtOutgoingCalls, outgoingCallResults: evtResults, finalStateHash } = event.args;
 
         // Check if this event applies to our current state
         if (prevBlockHash.toLowerCase() !== prevState.toLowerCase()) {
@@ -1096,13 +1626,28 @@ export class L2Fullnode implements IFullnodeRpc {
 
         log("Fullnode", `  Replaying IncomingCallHandled from L1 #${blockNumber}`);
 
-        await this.nativerollup_executeL1ToL2Call({
-          l1Caller,
-          l2Target: l2Address,
-          callData,
-          value: value.toString(),
-          currentStateRoot: prevBlockHash,
-        });
+        if (evtOutgoingCalls && evtOutgoingCalls.length > 0) {
+          const calls = evtOutgoingCalls.map((c: any) => ({
+            from: c.from,
+            target: c.target,
+            data: c.data,
+          }));
+          const results = evtResults || [];
+          log("Fullnode", `    With ${calls.length} outgoing L2→L1 call(s)`);
+          await this.nativerollup_executeL1ToL2CallWithOutgoingCalls(
+            { l1Caller, l2Target: l2Address, callData, value: value.toString(), currentStateRoot: prevBlockHash },
+            calls,
+            results
+          );
+        } else {
+          await this.nativerollup_executeL1ToL2Call({
+            l1Caller,
+            l2Target: l2Address,
+            callData,
+            value: value.toString(),
+            currentStateRoot: prevBlockHash,
+          });
+        }
       }
     }
 
@@ -1176,6 +1721,8 @@ export class L2Fullnode implements IFullnodeRpc {
             const finalStateHash = args.finalStateHash;
             const callData = args.callData;
             const value = args.value;
+            const evtOutgoingCalls = args.outgoingCalls;
+            const evtResults = args.outgoingCallResults;
 
             log("Fullnode", `IncomingCallHandled event:`);
             log("Fullnode", `  L2 address: ${l2Address}`);
@@ -1188,19 +1735,36 @@ export class L2Fullnode implements IFullnodeRpc {
               continue;
             }
 
-            await this.nativerollup_executeL1ToL2Call({
-              l1Caller,
-              l2Target: l2Address,
-              callData,
-              value: value.toString(),
-              currentStateRoot: currentState,
-            });
+            if (evtOutgoingCalls && evtOutgoingCalls.length > 0) {
+              const calls = evtOutgoingCalls.map((c: any) => ({
+                from: c.from,
+                target: c.target,
+                data: c.data,
+              }));
+              const results = evtResults || [];
+              log("Fullnode", `  With ${calls.length} outgoing L2→L1 call(s)`);
+              await this.nativerollup_executeL1ToL2CallWithOutgoingCalls(
+                { l1Caller, l2Target: l2Address, callData, value: value.toString(), currentStateRoot: currentState },
+                calls,
+                results
+              );
+            } else {
+              await this.nativerollup_executeL1ToL2Call({
+                l1Caller,
+                l2Target: l2Address,
+                callData,
+                value: value.toString(),
+                currentStateRoot: currentState,
+              });
+            }
           } else if (entry.type === 'l2block') {
             const e = entry.event;
             const args = (e as any).args;
             const blockNumber = args.blockNumber;
             const newBlockHash = args.newBlockHash;
             const rlpEncodedTx = args.rlpEncodedTx;
+            const evtOutgoingCalls = args.outgoingCalls;
+            const evtResults = args.outgoingCallResults;
 
             log("Fullnode", `L2BlockProcessed event:`);
             log("Fullnode", `  Block: ${blockNumber}`);
@@ -1213,7 +1777,21 @@ export class L2Fullnode implements IFullnodeRpc {
             }
 
             if (rlpEncodedTx && rlpEncodedTx !== "0x") {
-              await this.nativerollup_executeL2Transaction(rlpEncodedTx);
+              // Check if there are outgoing calls that need pre-registration
+              if (evtOutgoingCalls && evtOutgoingCalls.length > 0) {
+                const calls = evtOutgoingCalls.map((c: any) => ({
+                  from: c.from,
+                  target: c.target,
+                  data: c.data,
+                }));
+                const results = evtResults || [];
+                log("Fullnode", `  With ${calls.length} outgoing call(s)`);
+                await this.nativerollup_executeL2TransactionWithOutgoingCalls(
+                  rlpEncodedTx, calls, results
+                );
+              } else {
+                await this.nativerollup_executeL2Transaction(rlpEncodedTx);
+              }
             }
           }
         }

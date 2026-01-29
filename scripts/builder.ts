@@ -343,7 +343,12 @@ async function discoverAndRegisterAllL2Calls(
     const failedCalls = await extractFailedCalls(traceResult);
 
     // Combine all proxy calls (no dedup — same call may appear at different state hashes)
-    const allProxyCalls = [...proxyCalls, ...failedCalls];
+    // Filter out calls FROM the NativeRollupCore itself — these are internal calls
+    // within handleIncomingCall, not user-initiated L1→L2 proxy calls
+    const rollupLower = config.rollupAddress.toLowerCase();
+    const allProxyCalls = [...proxyCalls, ...failedCalls].filter(
+      c => c.l1Caller.toLowerCase() !== rollupLower
+    );
 
     if (allProxyCalls.length === 0) {
       if (!traceResult.error) {
@@ -395,25 +400,104 @@ async function discoverAndRegisterAllL2Calls(
       // Not registered — simulate and register
       log("Builder", `    [${proxyCall.callData.slice(0, 10)}] Simulating at ${stateHash.slice(0, 10)}... (l1Caller: ${proxyCall.l1Caller.slice(0, 10)}...)`);
 
-      // Use executeL1ToL2Call (persistent) so later calls see this call's state changes
-      // The fullnode snapshot taken before the loop will revert everything at the end
       const callValue = proxyCall.value && proxyCall.value !== "0x0" ? BigInt(proxyCall.value).toString() : "0";
-      const simResult = await fullnodeClient.nativerollup_executeL1ToL2Call({
-        l1Caller: proxyCall.l1Caller || tx.to!,
+      const l1Caller = proxyCall.l1Caller || tx.to!;
+
+      // Check for outgoing L2→L1 calls within this L1→L2 call
+      const outgoingL2Calls = await fullnodeClient.nativerollup_detectOutgoingCallsFromL1ToL2Call({
+        l1Caller,
         l2Target: proxyCall.l2Address,
         callData: proxyCall.callData,
         value: callValue,
-        currentStateRoot: stateHash,
       });
+
+      let simResult: any;
+      const responseOutgoingCalls: Array<{ from: string; target: string; value: string; gas: string; data: string; postCallStateHash: string }> = [];
+      const responseExpectedResults: string[] = [];
+
+      if (outgoingL2Calls.length > 0) {
+        log("Builder", `      Found ${outgoingL2Calls.length} outgoing L2→L1 call(s) within L1→L2 call`);
+
+        // Simulate each outgoing call on L1 to get expected results
+        const outgoingCallsForFullnode: Array<{ from: string; target: string; data: string }> = [];
+        const outgoingCallResults: string[] = [];
+
+        for (const oc of outgoingL2Calls) {
+          log("Builder", `      Simulating L1 call: ${oc.l2Caller} → L1:${oc.l1Address}`);
+          log("Builder", `        Calldata: ${oc.callData.slice(0, 10)}...`);
+
+          // Ensure L2SenderProxy exists on L1 for the L2 caller
+          const isDeployed = await rollupContract.isProxyDeployed(oc.l2Caller);
+          if (!isDeployed) {
+            log("Builder", `        Deploying L2SenderProxy on L1 for ${oc.l2Caller}...`);
+            const deployTx = await rollupContract.deployProxy(oc.l2Caller);
+            await deployTx.wait();
+          }
+          const l2SenderProxy = await rollupContract.getProxyAddress(oc.l2Caller);
+          log("Builder", `        L2SenderProxy on L1: ${l2SenderProxy}`);
+
+          // Simulate the L1 call via eth_call (from L2SenderProxy)
+          let l1Result = "0x";
+          try {
+            l1Result = await l1Provider.send("eth_call", [{
+              from: l2SenderProxy,
+              to: oc.l1Address,
+              data: oc.callData,
+            }, "latest"]);
+            log("Builder", `        L1 result: ${l1Result.slice(0, 42)}${l1Result.length > 42 ? '...' : ''}`);
+          } catch (err: any) {
+            log("Builder", `        L1 simulation failed: ${err.message}`);
+          }
+
+          outgoingCallsForFullnode.push({
+            from: oc.l2Caller,
+            target: oc.l1Address,
+            data: oc.callData,
+          });
+          outgoingCallResults.push(l1Result);
+
+          // For the L1 registerIncomingCall response
+          responseOutgoingCalls.push({
+            from: oc.l2Caller,
+            target: oc.l1Address,
+            value: "0",
+            gas: "100000",
+            data: oc.callData,
+            postCallStateHash: ethers.ZeroHash, // Will be filled after execution
+          });
+          responseExpectedResults.push(l1Result);
+        }
+
+        // Execute on builder fullnode with pre-registered outgoing call results
+        simResult = await fullnodeClient.nativerollup_executeL1ToL2CallWithOutgoingCalls(
+          { l1Caller, l2Target: proxyCall.l2Address, callData: proxyCall.callData, value: callValue, currentStateRoot: stateHash },
+          outgoingCallsForFullnode,
+          outgoingCallResults
+        );
+      } else {
+        // No outgoing calls — simple L1→L2 call
+        simResult = await fullnodeClient.nativerollup_executeL1ToL2Call({
+          l1Caller,
+          l2Target: proxyCall.l2Address,
+          callData: proxyCall.callData,
+          value: callValue,
+          currentStateRoot: stateHash,
+        });
+      }
 
       log("Builder", `      Result: ${simResult.success ? "SUCCESS" : "FAILED"}`);
       log("Builder", `      Return: ${(simResult.returnData || "0x").slice(0, 42)}...`);
       log("Builder", `      New state: ${simResult.newStateRoot.slice(0, 18)}...`);
 
+      // Fill in postCallStateHash for outgoing calls (use the final state for now)
+      for (const oc of responseOutgoingCalls) {
+        oc.postCallStateHash = simResult.newStateRoot;
+      }
+
       const response = {
         preOutgoingCallsStateHash: simResult.newStateRoot,
-        outgoingCalls: [],
-        expectedResults: [],
+        outgoingCalls: responseOutgoingCalls,
+        expectedResults: responseExpectedResults,
         returnValue: simResult.returnData || "0x",
         finalStateHash: simResult.newStateRoot,
       };
@@ -596,6 +680,68 @@ class FullnodeRpcClient {
   async nativerollup_isL1SenderProxyL2Deployed(l1Address: string): Promise<boolean> {
     return this.call("nativerollup_isL1SenderProxyL2Deployed", [l1Address]);
   }
+
+  async nativerollup_detectL2OutgoingCalls(rawTx: string): Promise<Array<{
+    l2Caller: string;
+    proxyAddress: string;
+    l1Address: string;
+    callData: string;
+  }>> {
+    return this.call("nativerollup_detectL2OutgoingCalls", [rawTx]);
+  }
+
+  async nativerollup_detectOutgoingCallsFromL1ToL2Call(params: {
+    l1Caller: string;
+    l2Target: string;
+    callData: string;
+    value?: string;
+  }): Promise<Array<{
+    l2Caller: string;
+    proxyAddress: string;
+    l1Address: string;
+    callData: string;
+  }>> {
+    return this.call("nativerollup_detectOutgoingCallsFromL1ToL2Call", [params]);
+  }
+
+  async nativerollup_executeL1ToL2CallWithOutgoingCalls(
+    params: { l1Caller: string; l2Target: string; callData: string; value?: string; currentStateRoot?: string },
+    outgoingCalls: Array<{ from: string; target: string; data: string }>,
+    outgoingCallResults: string[]
+  ): Promise<{
+    success: boolean;
+    txHash: string;
+    returnData: string;
+    newStateRoot: string;
+    gasUsed: string;
+    error?: string;
+  }> {
+    return this.call("nativerollup_executeL1ToL2CallWithOutgoingCalls", [params, outgoingCalls, outgoingCallResults]);
+  }
+
+  async nativerollup_registerL2OutgoingCallResult(params: {
+    l1Address: string;
+    l2Caller: string;
+    callData: string;
+    returnData: string;
+  }): Promise<{ callKey: string; txHash: string }> {
+    return this.call("nativerollup_registerL2OutgoingCallResult", [params]);
+  }
+
+  async nativerollup_executeL2TransactionWithOutgoingCalls(
+    rawTx: string,
+    outgoingCalls: Array<{ from: string; target: string; data: string }>,
+    outgoingCallResults: string[]
+  ): Promise<{
+    success: boolean;
+    txHash: string;
+    returnData: string;
+    newStateRoot: string;
+    gasUsed: string;
+    error?: string;
+  }> {
+    return this.call("nativerollup_executeL2TransactionWithOutgoingCalls", [rawTx, outgoingCalls, outgoingCallResults]);
+  }
 }
 
 let fullnodeClient: FullnodeRpcClient;
@@ -686,7 +832,15 @@ interface SubmitRequest {
 }
 
 /**
- * Process an L2 transaction
+ * Process an L2 transaction (may include L2→L1 outgoing calls)
+ *
+ * Flow:
+ * 1. Detect outgoing L2→L1 calls by tracing the L2 tx
+ * 2. For each outgoing call, simulate the L1 call to get the return value
+ * 3. Pre-register return values on builder's L2 fullnode
+ * 4. Execute the L2 tx on builder's fullnode (outgoing calls now succeed via registry)
+ * 5. Submit processSingleTxOnL2 to L1 with outgoingCalls[] and expectedResults[]
+ * 6. L1 executes the actual outgoing calls, verifies results match
  */
 async function processL2Transaction(signedTx: string): Promise<{
   l1TxHash: string;
@@ -710,6 +864,168 @@ async function processL2Transaction(signedTx: string): Promise<{
     throw new Error(`Fullnode not synced! L1: ${prevHash}, Fullnode: ${fullnodeState}`);
   }
 
+  // Step 1: Detect outgoing L2→L1 calls
+  log("Builder", `  Detecting outgoing L2→L1 calls...`);
+  const detectedOutgoingCalls = await fullnodeClient.nativerollup_detectL2OutgoingCalls(signedTx);
+
+  if (detectedOutgoingCalls.length === 0) {
+    // Simple case: no outgoing calls
+    log("Builder", `  No outgoing calls detected — simple L2 tx`);
+    return processSimpleL2Transaction(signedTx, prevHash);
+  }
+
+  log("Builder", `  Detected ${detectedOutgoingCalls.length} outgoing L2→L1 call(s):`);
+  for (const c of detectedOutgoingCalls) {
+    log("Builder", `    ${c.l2Caller} → L1:${c.l1Address} (${c.callData.slice(0, 10)})`);
+  }
+
+  // Step 2: For each outgoing call, simulate the L1 call to get the return value
+  // The L1 call is made through L2SenderProxy on L1 (the proxy for the L2 caller)
+  const outgoingCalls: Array<{
+    from: string;       // L2 contract
+    target: string;     // L1 contract
+    value: bigint;
+    gas: bigint;
+    data: string;       // Calldata for L1 function
+    postCallStateHash: string;
+  }> = [];
+  const expectedResults: string[] = [];
+
+  for (const call of detectedOutgoingCalls) {
+    log("Builder", `  Simulating L1 call: ${call.l2Caller} → ${call.l1Address}`);
+    log("Builder", `    Calldata: ${call.callData}`);
+
+    // Ensure L2SenderProxy is deployed on L1 for this L2 caller
+    const isDeployed = await rollupContract.isProxyDeployed(call.l2Caller);
+    if (!isDeployed) {
+      log("Builder", `    Deploying L2SenderProxy for ${call.l2Caller}...`);
+      const deployTx = await rollupContract.deployProxy(call.l2Caller);
+      await deployTx.wait();
+      const proxyAddr = await rollupContract.getProxyAddress(call.l2Caller);
+      log("Builder", `    Deployed at: ${proxyAddr}`);
+    }
+
+    // Get the L2SenderProxy address on L1
+    const l2SenderProxyOnL1 = await rollupContract.getProxyAddress(call.l2Caller);
+    log("Builder", `    L2SenderProxy on L1: ${l2SenderProxyOnL1}`);
+
+    // Simulate the L1 call through the L2SenderProxy
+    // The L2SenderProxy.execute(target, data) makes the actual L1 call
+    // But during processSingleTxOnL2, the NativeRollupCore calls execute() directly
+    // So we simulate: L2SenderProxy → target.call(data)
+    // Simpler: just simulate a direct call to the target with the calldata
+    try {
+      const l1Result = await l1Provider.call({
+        to: call.l1Address,
+        data: call.callData,
+        from: l2SenderProxyOnL1, // msg.sender will be the L2SenderProxy
+      });
+      log("Builder", `    L1 simulation result: ${l1Result.slice(0, 42)}${l1Result.length > 42 ? '...' : ''}`);
+
+      expectedResults.push(l1Result);
+    } catch (err: any) {
+      log("Builder", `    L1 simulation failed: ${err.message}`);
+      throw new Error(`Outgoing L1 call simulation failed for ${call.l1Address}: ${err.message}`);
+    }
+  }
+
+  // Step 3: Pre-register return values on builder's L2 fullnode
+  // and execute the L2 tx with outgoing calls
+  log("Builder", `  Executing L2 tx with outgoing calls on builder fullnode...`);
+
+  const outgoingCallsForFullnode = detectedOutgoingCalls.map(c => ({
+    from: c.l2Caller,
+    target: c.l1Address,
+    data: c.callData,
+  }));
+
+  const execResult = await fullnodeClient.nativerollup_executeL2TransactionWithOutgoingCalls(
+    signedTx,
+    outgoingCallsForFullnode,
+    expectedResults
+  );
+
+  if (!execResult.success) {
+    throw new Error(`L2 execution with outgoing calls failed: ${execResult.error || "unknown error"}`);
+  }
+
+  log("Builder", `  L2 tx executed: ${execResult.txHash}`);
+  log("Builder", `  New state root (preOutgoingCallsStateHash): ${execResult.newStateRoot}`);
+
+  const preOutgoingCallsStateHash = execResult.newStateRoot;
+
+  // Step 4: Build outgoing call structs for L1 submission
+  // For each outgoing call, the postCallStateHash is the L2 state after that L1 call.
+  // In this POC, L1 calls don't modify L2 state (no re-entrant L1→L2 calls during outgoing),
+  // so postCallStateHash = preOutgoingCallsStateHash for all calls.
+  // In the general case, each L1 call might trigger an incoming L2 call,
+  // changing the L2 state.
+  for (let i = 0; i < detectedOutgoingCalls.length; i++) {
+    const call = detectedOutgoingCalls[i];
+    outgoingCalls.push({
+      from: call.l2Caller,
+      target: call.l1Address,
+      value: 0n,
+      gas: 500000n, // Gas limit for L1 call
+      data: call.callData,
+      postCallStateHash: preOutgoingCallsStateHash, // Same state — L1 call doesn't modify L2
+    });
+  }
+
+  // finalStateHash = preOutgoingCallsStateHash since no L2 state changes from L1 calls
+  const finalStateHash = preOutgoingCallsStateHash;
+
+  // Step 5: Sign proof and submit to L1
+  const proof = await signProof(
+    prevHash,
+    signedTx,
+    preOutgoingCallsStateHash,
+    outgoingCalls.map(c => ({
+      from: c.from,
+      target: c.target,
+      value: c.value,
+      gas: c.gas,
+      data: c.data,
+      postCallStateHash: c.postCallStateHash,
+    })),
+    expectedResults,
+    finalStateHash
+  );
+
+  log("Builder", `Submitting to L1 (with ${outgoingCalls.length} outgoing calls)...`);
+  const l1Tx = await rollupContract.processSingleTxOnL2(
+    prevHash,
+    signedTx,
+    preOutgoingCallsStateHash,
+    outgoingCalls,
+    expectedResults,
+    finalStateHash,
+    proof
+  );
+  const l1Receipt = await l1Tx.wait();
+
+  if (!l1Receipt || l1Receipt.status !== 1) {
+    throw new Error("L1 transaction with outgoing calls reverted");
+  }
+
+  log("Builder", `  L1 tx: ${l1Receipt?.hash}`);
+  log("Builder", `  SUCCESS — L2 tx with ${outgoingCalls.length} outgoing L1 call(s) processed`);
+
+  return {
+    l1TxHash: l1Receipt?.hash || "",
+    l2TxHash: execResult.txHash,
+    l2StateRoot: finalStateHash,
+  };
+}
+
+/**
+ * Process a simple L2 transaction (no outgoing calls)
+ */
+async function processSimpleL2Transaction(signedTx: string, prevHash: string): Promise<{
+  l1TxHash: string;
+  l2TxHash: string;
+  l2StateRoot: string;
+}> {
   // Execute on fullnode to get the new state root
   log("Builder", `  Executing on fullnode...`);
   const execResult = await fullnodeClient.nativerollup_executeL2Transaction(signedTx);
@@ -841,17 +1157,24 @@ async function processL1ContractCall(
   }
 
   // 3. Dry-run the user's tx via eth_call to verify it would succeed
-  try {
-    await l1Provider.call({
-      from: tx.from,
-      to: tx.to,
-      data: tx.data,
-      value: tx.value,
-    });
-    log("Builder", `  Pre-check: eth_call dry-run succeeded`);
-  } catch (dryRunErr: any) {
-    const reason = dryRunErr.message || "unknown";
-    throw new Error(`Pre-broadcast check failed: dry-run reverted: ${reason}`);
+  // Skip dry-run for txs with L2 calls — the proxy fallback can't return
+  // registered responses during a plain eth_call (only works during
+  // processSingleTxOnL2). The L2 simulation already verified correctness.
+  if (discovery.callDetails.length === 0) {
+    try {
+      await l1Provider.call({
+        from: tx.from,
+        to: tx.to,
+        data: tx.data,
+        value: tx.value,
+      });
+      log("Builder", `  Pre-check: eth_call dry-run succeeded`);
+    } catch (dryRunErr: any) {
+      const reason = dryRunErr.message || "unknown";
+      throw new Error(`Pre-broadcast check failed: dry-run reverted: ${reason}`);
+    }
+  } else {
+    log("Builder", `  Pre-check: skipping eth_call dry-run (tx has ${discovery.callDetails.length} L2 call(s) — proxy can't serve responses in plain eth_call)`);
   }
 
   // === Broadcast ===
@@ -859,13 +1182,15 @@ async function processL1ContractCall(
   const l1TxHash = await l1Provider.send("eth_sendRawTransaction", [signedTx]);
   await l1Provider.send("anvil_mine", [1, 0]);
 
-  // Wait for receipt with timeout (30s)
-  const l1Receipt = await Promise.race([
-    l1Provider.waitForTransaction(l1TxHash),
-    new Promise<null>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout waiting for tx ${l1TxHash} after 30s`)), 30000)
-    ),
-  ]);
+  // Get receipt directly after mining
+  let l1Receipt = await l1Provider.getTransactionReceipt(l1TxHash);
+  if (!l1Receipt) {
+    // Retry a few times in case of delay
+    for (let i = 0; i < 5 && !l1Receipt; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      l1Receipt = await l1Provider.getTransactionReceipt(l1TxHash);
+    }
+  }
 
   if (!l1Receipt || l1Receipt.status !== 1) {
     // Get the revert reason if possible
