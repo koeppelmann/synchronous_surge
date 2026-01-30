@@ -75,6 +75,32 @@ function parseArgs(): Config {
 let l1Provider: JsonRpcProvider;
 let adminWallet: Wallet;
 let rollupContract: Contract;
+let isAnvilL1 = false; // Detected at startup; enables anvil_mine, evm_snapshot etc.
+
+/**
+ * Mine a block on L1 if running on Anvil, otherwise no-op (real chain mines itself).
+ */
+async function mineL1Block(): Promise<void> {
+  if (isAnvilL1) {
+    await l1Provider.send("anvil_mine", [1, 0]);
+  }
+}
+
+/**
+ * Wait for an L1 transaction receipt, polling if needed.
+ * On Anvil we mine first; on real chains we just wait.
+ */
+async function waitForL1Receipt(txHash: string, maxWaitMs = 120_000): Promise<any> {
+  await mineL1Block();
+
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const receipt = await l1Provider.getTransactionReceipt(txHash);
+    if (receipt) return receipt;
+    await new Promise(r => setTimeout(r, isAnvilL1 ? 500 : 3000));
+  }
+  throw new Error(`Timeout waiting for L1 tx receipt: ${txHash}`);
+}
 let config: Config;
 
 const ROLLUP_ABI = [
@@ -681,13 +707,18 @@ class FullnodeRpcClient {
     return this.call("nativerollup_isL1SenderProxyL2Deployed", [l1Address]);
   }
 
-  async nativerollup_detectL2OutgoingCalls(rawTx: string): Promise<Array<{
+  async nativerollup_ensureL1SenderProxyL2(l1Address: string): Promise<string> {
+    return this.call("nativerollup_ensureL1SenderProxyL2", [l1Address]);
+  }
+
+  async nativerollup_detectL2OutgoingCalls(rawTx: string, l1Addresses?: string[]): Promise<Array<{
     l2Caller: string;
     proxyAddress: string;
     l1Address: string;
     callData: string;
+    value: string; // hex-encoded value
   }>> {
-    return this.call("nativerollup_detectL2OutgoingCalls", [rawTx]);
+    return this.call("nativerollup_detectL2OutgoingCalls", [rawTx, l1Addresses || []]);
   }
 
   async nativerollup_detectOutgoingCallsFromL1ToL2Call(params: {
@@ -825,6 +856,7 @@ interface SubmitRequest {
   sourceChain: "L1" | "L2";
   hints?: {
     l2TargetAddress?: string;
+    l1TargetAddress?: string;
     expectedReturnValue?: string;
     isContractCall?: boolean;
     l2Addresses?: string[];
@@ -842,7 +874,7 @@ interface SubmitRequest {
  * 5. Submit processSingleTxOnL2 to L1 with outgoingCalls[] and expectedResults[]
  * 6. L1 executes the actual outgoing calls, verifies results match
  */
-async function processL2Transaction(signedTx: string): Promise<{
+async function processL2Transaction(signedTx: string, hints?: { l1TargetAddress?: string }): Promise<{
   l1TxHash: string;
   l2TxHash: string;
   l2StateRoot: string;
@@ -865,8 +897,10 @@ async function processL2Transaction(signedTx: string): Promise<{
   }
 
   // Step 1: Detect outgoing L2→L1 calls
-  log("Builder", `  Detecting outgoing L2→L1 calls...`);
-  const detectedOutgoingCalls = await fullnodeClient.nativerollup_detectL2OutgoingCalls(signedTx);
+  // Pass L1 target address hint so the detection can temporarily deploy the proxy for tracing
+  const l1Addresses = hints?.l1TargetAddress ? [hints.l1TargetAddress] : [];
+  log("Builder", `  Detecting outgoing L2→L1 calls...${l1Addresses.length ? ` (hint: L1 target ${l1Addresses[0]})` : ""}`);
+  const detectedOutgoingCalls = await fullnodeClient.nativerollup_detectL2OutgoingCalls(signedTx, l1Addresses);
 
   if (detectedOutgoingCalls.length === 0) {
     // Simple case: no outgoing calls
@@ -876,7 +910,8 @@ async function processL2Transaction(signedTx: string): Promise<{
 
   log("Builder", `  Detected ${detectedOutgoingCalls.length} outgoing L2→L1 call(s):`);
   for (const c of detectedOutgoingCalls) {
-    log("Builder", `    ${c.l2Caller} → L1:${c.l1Address} (${c.callData.slice(0, 10)})`);
+    const valStr = c.value && c.value !== "0x0" ? ` value=${ethers.formatEther(BigInt(c.value))}` : "";
+    log("Builder", `    ${c.l2Caller} → L1:${c.l1Address} (${c.callData.slice(0, 10)})${valStr}`);
   }
 
   // Step 2: For each outgoing call, simulate the L1 call to get the return value
@@ -912,20 +947,31 @@ async function processL2Transaction(signedTx: string): Promise<{
     // Simulate the L1 call through the L2SenderProxy
     // The L2SenderProxy.execute(target, data) makes the actual L1 call
     // But during processSingleTxOnL2, the NativeRollupCore calls execute() directly
-    // So we simulate: L2SenderProxy → target.call(data)
-    // Simpler: just simulate a direct call to the target with the calldata
-    try {
-      const l1Result = await l1Provider.call({
-        to: call.l1Address,
-        data: call.callData,
-        from: l2SenderProxyOnL1, // msg.sender will be the L2SenderProxy
-      });
-      log("Builder", `    L1 simulation result: ${l1Result.slice(0, 42)}${l1Result.length > 42 ? '...' : ''}`);
+    // So we simulate: L2SenderProxy → target.call{value}(data)
+    const callValue = call.value ? BigInt(call.value) : 0n;
 
-      expectedResults.push(l1Result);
-    } catch (err: any) {
-      log("Builder", `    L1 simulation failed: ${err.message}`);
-      throw new Error(`Outgoing L1 call simulation failed for ${call.l1Address}: ${err.message}`);
+    // Check if target is an EOA (no code) — for value-only transfers, result is always 0x
+    const targetCode = await l1Provider.getCode(call.l1Address);
+    const isEOA = !targetCode || targetCode === "0x";
+
+    if (isEOA) {
+      log("Builder", `    L1 target is EOA — expected result: 0x (value transfer: ${ethers.formatEther(callValue)} ETH)`);
+      expectedResults.push("0x");
+    } else {
+      try {
+        const l1Result = await l1Provider.call({
+          to: call.l1Address,
+          data: call.callData,
+          from: l2SenderProxyOnL1, // msg.sender will be the L2SenderProxy
+          value: callValue,
+        });
+        log("Builder", `    L1 simulation result: ${l1Result.slice(0, 42)}${l1Result.length > 42 ? '...' : ''}`);
+
+        expectedResults.push(l1Result);
+      } catch (err: any) {
+        log("Builder", `    L1 simulation failed: ${err.message}`);
+        throw new Error(`Outgoing L1 call simulation failed for ${call.l1Address}: ${err.message}`);
+      }
     }
   }
 
@@ -962,10 +1008,11 @@ async function processL2Transaction(signedTx: string): Promise<{
   // changing the L2 state.
   for (let i = 0; i < detectedOutgoingCalls.length; i++) {
     const call = detectedOutgoingCalls[i];
+    const callValue = call.value ? BigInt(call.value) : 0n;
     outgoingCalls.push({
       from: call.l2Caller,
       target: call.l1Address,
-      value: 0n,
+      value: callValue,
       gas: 500000n, // Gas limit for L1 call
       data: call.callData,
       postCallStateHash: preOutgoingCallsStateHash, // Same state — L1 call doesn't modify L2
@@ -992,7 +1039,9 @@ async function processL2Transaction(signedTx: string): Promise<{
     finalStateHash
   );
 
-  log("Builder", `Submitting to L1 (with ${outgoingCalls.length} outgoing calls)...`);
+  // Calculate total value needed for outgoing calls
+  const totalOutgoingValue = outgoingCalls.reduce((sum, c) => sum + c.value, 0n);
+  log("Builder", `Submitting to L1 (with ${outgoingCalls.length} outgoing calls, total value: ${ethers.formatEther(totalOutgoingValue)})...`);
   const l1Tx = await rollupContract.processSingleTxOnL2(
     prevHash,
     signedTx,
@@ -1000,7 +1049,8 @@ async function processL2Transaction(signedTx: string): Promise<{
     outgoingCalls,
     expectedResults,
     finalStateHash,
-    proof
+    proof,
+    { value: totalOutgoingValue }
   );
   const l1Receipt = await l1Tx.wait();
 
@@ -1031,7 +1081,8 @@ async function processSimpleL2Transaction(signedTx: string, prevHash: string): P
   const execResult = await fullnodeClient.nativerollup_executeL2Transaction(signedTx);
 
   if (!execResult.success) {
-    throw new Error(`L2 execution failed: ${execResult.error || "unknown error"}`);
+    const tx = Transaction.from(signedTx);
+    throw new Error(`L2 execution reverted (from: ${tx.from}, to: ${tx.to}, data: ${tx.data?.slice(0, 10) || '0x'}). ${execResult.error || ''}`);
   }
 
   log("Builder", `  L2 tx executed: ${execResult.txHash}`);
@@ -1180,17 +1231,7 @@ async function processL1ContractCall(
   // === Broadcast ===
   log("Builder", `Broadcasting L1 tx...`);
   const l1TxHash = await l1Provider.send("eth_sendRawTransaction", [signedTx]);
-  await l1Provider.send("anvil_mine", [1, 0]);
-
-  // Get receipt directly after mining
-  let l1Receipt = await l1Provider.getTransactionReceipt(l1TxHash);
-  if (!l1Receipt) {
-    // Retry a few times in case of delay
-    for (let i = 0; i < 5 && !l1Receipt; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      l1Receipt = await l1Provider.getTransactionReceipt(l1TxHash);
-    }
-  }
+  let l1Receipt = await waitForL1Receipt(l1TxHash);
 
   if (!l1Receipt || l1Receipt.status !== 1) {
     // Get the revert reason if possible
@@ -1283,7 +1324,9 @@ async function handleRequest(
       let result: any;
 
       if (request.sourceChain === "L2") {
-        result = await processL2Transaction(request.signedTx);
+        result = await processL2Transaction(request.signedTx, {
+          l1TargetAddress: request.hints?.l1TargetAddress,
+        });
       } else if (request.hints?.l2Addresses) {
         result = await processL1ContractCall(request.signedTx, request.hints.l2Addresses);
       } else if (request.hints?.l2TargetAddress) {
@@ -1324,37 +1367,9 @@ async function handleRequest(
             const txHash = await l1Provider.send("eth_sendRawTransaction", [request.signedTx]);
             log("Builder", `  TX submitted: ${txHash}`);
 
-            // Mine block to include the transaction
-            // Use anvil_mine which is more reliable for including pending txs
-            await l1Provider.send("anvil_mine", [1, 0]);
-            log("Builder", `  Block mined`);
-
-            // Check if tx was included by getting the receipt directly
-            const receipt = await l1Provider.getTransactionReceipt(txHash);
-
-            if (receipt) {
-              log("Builder", `  Status: ${receipt.status === 1 ? "SUCCESS" : "REVERTED"}`);
-              result = { l1TxHash: receipt.hash, status: receipt.status };
-            } else {
-              // Transaction not included - check if it's still pending
-              const pendingTx = await l1Provider.getTransaction(txHash);
-              if (pendingTx && pendingTx.blockNumber === null) {
-                // TX is pending but not mined - try mining again
-                log("Builder", `  TX pending, mining additional block...`);
-                await l1Provider.send("anvil_mine", [1, 0]);
-                const retryReceipt = await l1Provider.getTransactionReceipt(txHash);
-                if (retryReceipt) {
-                  log("Builder", `  Status: ${retryReceipt.status === 1 ? "SUCCESS" : "REVERTED"}`);
-                  result = { l1TxHash: retryReceipt.hash, status: retryReceipt.status };
-                } else {
-                  // Check nonce - if it's ahead of account nonce, that's the issue
-                  const currentNonce = await l1Provider.getTransactionCount(pendingTx.from);
-                  throw new Error(`Transaction not mined. TX nonce: ${pendingTx.nonce}, Account nonce: ${currentNonce}. Reset your wallet nonce.`);
-                }
-              } else {
-                throw new Error("Transaction disappeared from mempool");
-              }
-            }
+            const receipt = await waitForL1Receipt(txHash);
+            log("Builder", `  Status: ${receipt.status === 1 ? "SUCCESS" : "REVERTED"}`);
+            result = { l1TxHash: receipt.hash, status: receipt.status };
           } catch (err: any) {
             log("Builder", `  Error: ${err.message}`);
             throw err;
@@ -1376,6 +1391,12 @@ async function handleRequest(
 
       const request: SubmitRequest = JSON.parse(body);
       log("API", `Received simulation request`);
+
+      if (!isAnvilL1) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Simulation not supported on live L1 chains (requires evm_snapshot)" }));
+        return;
+      }
 
       // Take L1 snapshot so all registrations are reverted afterwards
       const l1Snapshot = await l1Provider.send("evm_snapshot", []);
@@ -1478,6 +1499,16 @@ async function main() {
 
   // Initialize rollup contract
   rollupContract = new Contract(config.rollupAddress, ROLLUP_ABI, adminWallet);
+
+  // Detect if L1 is Anvil (enables anvil_mine, evm_snapshot, etc.)
+  try {
+    await l1Provider.send("anvil_nodeInfo", []);
+    isAnvilL1 = true;
+    log("Builder", `L1 type: Anvil (local devnet)`);
+  } catch {
+    isAnvilL1 = false;
+    log("Builder", `L1 type: Live chain (no anvil_mine, no simulation)`);
+  }
 
   // Verify connections
   try {

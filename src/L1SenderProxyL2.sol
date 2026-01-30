@@ -107,7 +107,23 @@ contract L1SenderProxyL2 {
     }
 
     receive() external payable {
-        // Accept ETH transfers (for deposits)
+        if (msg.sender == systemAddress) {
+            // L1 → L2 direction: System is forwarding a value transfer from L1
+            // No calldata, just accept the ETH
+            return;
+        }
+
+        // L2 → L1 direction: Someone on L2 is sending value to an L1 address
+        // Look up the pre-registered return value (with empty calldata)
+        bytes32 callKey = keccak256(abi.encodePacked(l1Address, msg.sender, bytes("")));
+
+        (bool registered, ) = callRegistry.getReturnValue(callKey);
+
+        if (!registered) {
+            revert OutgoingCallNotRegistered();
+        }
+
+        emit OutgoingCallHandled(bytes4(0), bytes(""));
     }
 }
 

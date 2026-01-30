@@ -65,6 +65,9 @@ const L2_PROXY_DETECTION_MAGIC_BALANCE = "0x4c3250524f585952"; // "L2PROXYR" in 
 let config: Config;
 let provider: ethers.JsonRpcProvider;
 
+// Pending hints keyed by sender address (lowercase) - consumed on next eth_sendRawTransaction
+const pendingHints: Map<string, any> = new Map();
+
 // ============ Logging ============
 
 function log(component: string, message: string) {
@@ -77,6 +80,7 @@ function log(component: string, message: string) {
 interface BuilderSubmitRequest {
   signedTx: string;
   sourceChain: "L1" | "L2";
+  hints?: any;
 }
 
 async function submitToBuilder(request: BuilderSubmitRequest): Promise<any> {
@@ -129,10 +133,19 @@ async function handleSendRawTransaction(
     log("L2Proxy", `  Value: ${ethers.formatEther(tx.value)} ETH`);
     log("L2Proxy", `  Routing through builder (processCallOnL2)...`);
 
+    // Check for pre-registered hints for this sender
+    const senderKey = tx.from?.toLowerCase();
+    const hints = senderKey ? pendingHints.get(senderKey) : undefined;
+    if (hints) {
+      pendingHints.delete(senderKey!);
+      log("L2Proxy", `  Using pre-registered hints: ${JSON.stringify(hints)}`);
+    }
+
     // Submit to builder with sourceChain: L2
     const result = await submitToBuilder({
       signedTx,
       sourceChain: "L2",
+      ...(hints ? { hints } : {}),
     });
 
     log("L2Proxy", `  L1 tx hash: ${result.l1TxHash}`);
@@ -177,6 +190,27 @@ async function handleRequest(
   }
 
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
+
+  if (url.pathname === "/register-hint" && req.method === "POST") {
+    try {
+      const body = await readBody(req);
+      const hint = JSON.parse(body);
+      // Store hint keyed by sender address
+      if (hint.sender) {
+        const key = hint.sender.toLowerCase();
+        pendingHints.set(key, hint);
+        log("L2Proxy", `Registered hint for ${key}: ${JSON.stringify(hint)}`);
+        // Auto-expire after 60 seconds
+        setTimeout(() => pendingHints.delete(key), 60000);
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (err: any) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
 
   if (url.pathname === "/status" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });

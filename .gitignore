@@ -12,3 +12,12 @@ docs/
 
 # Dotenv file
 .env
+
+# Deployment artifacts
+gnosis-deployment.json
+
+# Logs
+logs/
+
+# Node
+node_modules/

@@ -56,6 +56,7 @@ export interface L2FullnodeConfig {
   rpcPort: number;          // Port for fullnode RPC server
   l2ChainId: number;
   systemPrivateKey: string; // System address private key
+  l1StartBlock: number;     // L1 block to start scanning events from (0 = genesis)
 }
 
 const DEFAULT_CONFIG: L2FullnodeConfig = {
@@ -67,6 +68,7 @@ const DEFAULT_CONFIG: L2FullnodeConfig = {
   // System address: 0x1000000000000000000000000000000000000001
   // This is the "sequencer" that executes all L2 operations
   systemPrivateKey: process.env.SYSTEM_PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000001",
+  l1StartBlock: parseInt(process.env.L1_START_BLOCK || "0"),
 };
 
 // ============ Constants ============
@@ -471,6 +473,9 @@ export class L2Fullnode implements IFullnodeRpc {
       case "nativerollup_isL1SenderProxyL2Deployed":
         return this.nativerollup_isL1SenderProxyL2Deployed(params[0]);
 
+      case "nativerollup_ensureL1SenderProxyL2":
+        return this.nativerollup_ensureL1SenderProxyL2(params[0]);
+
       case "nativerollup_verifyStateChain":
         return this.nativerollup_verifyStateChain(params[0]);
 
@@ -481,7 +486,7 @@ export class L2Fullnode implements IFullnodeRpc {
         return this.nativerollup_executeL2TransactionWithOutgoingCalls(params[0], params[1], params[2]);
 
       case "nativerollup_detectL2OutgoingCalls":
-        return this.nativerollup_detectL2OutgoingCalls(params[0]);
+        return this.nativerollup_detectL2OutgoingCalls(params[0], params[1]);
 
       case "nativerollup_detectOutgoingCallsFromL1ToL2Call":
         return this.nativerollup_detectOutgoingCallsFromL1ToL2Call(params[0]);
@@ -581,7 +586,21 @@ export class L2Fullnode implements IFullnodeRpc {
 
     try {
       log("Fullnode", `  Sending to L2 EVM...`);
-      const txHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTx]);
+      let txHash: string;
+      try {
+        txHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTx]);
+      } catch (sendErr: any) {
+        const errMsg = sendErr.info?.error?.message || sendErr.error?.message || sendErr.message || "";
+        if (errMsg.includes("already imported") || errMsg.includes("already known")) {
+          // Transaction is stuck in the pending pool from a prior attempt.
+          // Drop all pending transactions and retry.
+          log("Fullnode", `  Transaction already in pool, clearing pending txs and retrying...`);
+          await this.l2Provider.send("anvil_dropAllTransactions", []);
+          txHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTx]);
+        } else {
+          throw sendErr;
+        }
+      }
       log("Fullnode", `  TX Hash: ${txHash}`);
 
       // Mine a block first to include the transaction
@@ -592,19 +611,41 @@ export class L2Fullnode implements IFullnodeRpc {
       const receipt = await this.l2Provider.getTransactionReceipt(txHash);
       log("Fullnode", `  Receipt status: ${receipt?.status}`);
 
+      if (!receipt) {
+        const tx = Transaction.from(rawTx);
+        const expectedNonce = await this.l2Provider.send("eth_getTransactionCount", [tx.from!, "latest"]);
+        log("Fullnode", `  TX not mined! TX nonce: ${tx.nonce}, account nonce: ${parseInt(expectedNonce, 16)}`);
+        return {
+          success: false,
+          txHash,
+          returnData: "0x",
+          newStateRoot: await this.nativerollup_getStateRoot(),
+          gasUsed: "0",
+          logs: [],
+          error: `L2 transaction not mined (tx nonce: ${tx.nonce}, expected: ${parseInt(expectedNonce, 16)}). Reset your wallet nonce.`,
+        };
+      }
+
       const newStateRoot = await this.nativerollup_getStateRoot();
       log("Fullnode", `  New state root: ${newStateRoot}`);
 
       return {
-        success: receipt?.status === 1,
+        success: receipt.status === 1,
         txHash,
         returnData: "0x",
         newStateRoot,
-        gasUsed: (receipt?.gasUsed || 0n).toString(),  // Convert bigint to string for JSON
+        gasUsed: (receipt.gasUsed || 0n).toString(),  // Convert bigint to string for JSON
         logs: [],
       };
     } catch (err: any) {
-      log("Fullnode", `  Error: ${err.message}`);
+      // Extract more specific error info
+      let errorMsg = err.message;
+      if (err.info?.error?.message) {
+        errorMsg = err.info.error.message;
+      } else if (err.error?.message) {
+        errorMsg = err.error.message;
+      }
+      log("Fullnode", `  Error: ${errorMsg}`);
       return {
         success: false,
         txHash: "0x0",
@@ -629,6 +670,28 @@ export class L2Fullnode implements IFullnodeRpc {
 
   async nativerollup_isL1SenderProxyL2Deployed(l1Address: string): Promise<boolean> {
     return this.l1ProxyAddresses.has(l1Address.toLowerCase());
+  }
+
+  /**
+   * Ensure an L1SenderProxyL2 is deployed for the given L1 address.
+   * Deploys it if not already deployed, then mines the block.
+   */
+  async nativerollup_ensureL1SenderProxyL2(l1Address: string): Promise<string> {
+    const existing = this.l1ProxyAddresses.get(l1Address.toLowerCase());
+    if (existing) return existing;
+
+    log("Fullnode", `Deploying L1SenderProxyL2 for ${l1Address}...`);
+    const address = await this.deployL1SenderProxyL2(
+      l1Address,
+      this.l2Provider,
+      this.systemWallet,
+      true
+    );
+
+    // Mine the block to include the deploy tx
+    await this.l2Provider.send("evm_mine", []);
+    log("Fullnode", `  L1SenderProxyL2 deployed at ${address}`);
+    return address;
   }
 
   /**
@@ -689,7 +752,7 @@ export class L2Fullnode implements IFullnodeRpc {
     const tx = await registry.registerReturnValue(
       callKey,
       params.returnData || "0x",
-      { nonce: parseInt(nonce, 16) }
+      { nonce: parseInt(nonce, 16), gasPrice: 0 }
     );
 
     // Mine the registration tx
@@ -738,6 +801,18 @@ export class L2Fullnode implements IFullnodeRpc {
       this.systemWallet
     );
 
+    // Step 0: Ensure L1SenderProxyL2 is deployed for each L1 target address
+    // The proxy must exist so the L2 tx can call it (triggering registry lookup)
+    const uniqueTargets = [...new Set(outgoingCalls.map(c => c.target.toLowerCase()))];
+    for (const target of uniqueTargets) {
+      const isDeployed = this.l1ProxyAddresses.has(target);
+      if (!isDeployed) {
+        log("Fullnode", `  Deploying L1SenderProxyL2 for L1:${target}...`);
+        await this.deployL1SenderProxyL2(target, this.l2Provider, this.systemWallet, true);
+      }
+    }
+    // Proxy deploy txs are in the mempool — they'll be mined with registrations + L2 tx
+
     // Step 1: Send all registration txs to the mempool (NO mining yet).
     // The registration + L2 tx will all be mined in a single block
     // to produce a deterministic state root.
@@ -773,23 +848,57 @@ export class L2Fullnode implements IFullnodeRpc {
         continue;
       }
 
-      // Send to mempool — do NOT mine yet
-      await registry.registerReturnValue(callKey, result, { nonce: nonce++ });
+      // Send to mempool — do NOT mine yet.
+      // Use very high gasPrice to ensure Anvil orders registrations before user txs.
+      await registry.registerReturnValue(callKey, result, { nonce: nonce++, gasPrice: 0 });
       log("Fullnode", `    Registration tx sent (nonce ${nonce - 1})`);
     }
 
-    // Step 2: Send the L2 user tx to the mempool
-    log("Fullnode", `  Sending L2 tx to mempool...`);
-    const txHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTx]);
+    // Step 2: Mine registrations (+ any proxy deploys) in their own block.
+    // This must happen before the user tx because Anvil orders by gas price,
+    // and user txs from real wallets have higher gas price than system txs (gasPrice 0).
+    log("Fullnode", `  Mining registration block...`);
+    await this.l2Provider.send("evm_mine", []);
+
+    // Step 3: Send the L2 user tx and mine it
+    log("Fullnode", `  Sending L2 tx...`);
+    let txHash: string;
+    try {
+      txHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTx]);
+    } catch (sendErr: any) {
+      const errMsg = sendErr.info?.error?.message || sendErr.error?.message || sendErr.message || "";
+      if (errMsg.includes("already imported") || errMsg.includes("already known")) {
+        log("Fullnode", `  Transaction already in pool, clearing and retrying...`);
+        await this.l2Provider.send("anvil_dropAllTransactions", []);
+        txHash = await this.l2Provider.send("eth_sendRawTransaction", [rawTx]);
+      } else {
+        throw sendErr;
+      }
+    }
     log("Fullnode", `  TX Hash: ${txHash}`);
 
-    // Step 3: Mine a single block containing ALL txs (registrations + user tx)
-    log("Fullnode", `  Mining single block with registrations + L2 tx...`);
+    log("Fullnode", `  Mining L2 tx block...`);
     await this.l2Provider.send("evm_mine", []);
 
     // Get the receipt
     const receipt = await this.l2Provider.getTransactionReceipt(txHash);
     log("Fullnode", `  Receipt status: ${receipt?.status}`);
+
+    if (!receipt) {
+      // TX was not mined — likely nonce mismatch
+      const tx = Transaction.from(rawTx);
+      const expectedNonce = await this.l2Provider.send("eth_getTransactionCount", [tx.from!, "latest"]);
+      log("Fullnode", `  TX not mined! TX nonce: ${tx.nonce}, account nonce: ${parseInt(expectedNonce, 16)}`);
+      return {
+        success: false,
+        txHash,
+        returnData: "0x",
+        newStateRoot: await this.nativerollup_getStateRoot(),
+        gasUsed: "0",
+        logs: [],
+        error: `L2 transaction not mined (tx nonce: ${tx.nonce}, expected: ${parseInt(expectedNonce, 16)}). Reset your wallet nonce.`,
+      };
+    }
 
     const newStateRoot = await this.nativerollup_getStateRoot();
     log("Fullnode", `  New state root: ${newStateRoot}`);
@@ -799,13 +908,13 @@ export class L2Fullnode implements IFullnodeRpc {
     // at which point they'll be consumed and new values registered.
 
     return {
-      success: receipt?.status === 1,
+      success: receipt.status === 1,
       txHash,
       returnData: "0x",
       newStateRoot,
-      gasUsed: (receipt?.gasUsed || 0n).toString(),
+      gasUsed: (receipt.gasUsed || 0n).toString(),
       logs: [],
-      error: receipt?.status === 1 ? undefined : "L2 transaction reverted",
+      error: receipt.status === 1 ? undefined : "L2 transaction reverted",
     };
   }
 
@@ -817,17 +926,33 @@ export class L2Fullnode implements IFullnodeRpc {
    *
    * Returns the list of outgoing calls detected.
    */
-  async nativerollup_detectL2OutgoingCalls(rawTx: string): Promise<Array<{
+  async nativerollup_detectL2OutgoingCalls(rawTx: string, l1Addresses?: string[]): Promise<Array<{
     l2Caller: string;
     proxyAddress: string;
     l1Address: string;
     callData: string;
+    value: string; // hex-encoded value
   }>> {
     log("Fullnode", `Detecting L2→L1 outgoing calls...`);
 
     // Parse the transaction to get from/to/data
     const tx = Transaction.from(rawTx);
     log("Fullnode", `  TX from: ${tx.from}, to: ${tx.to}`);
+
+    // If L1 addresses are provided, ensure their L2 proxies are deployed (in a snapshot)
+    // This is needed so the trace can identify calls to proxy contracts
+    let snapshotId: string | null = null;
+    if (l1Addresses && l1Addresses.length > 0) {
+      snapshotId = await this.l2Provider.send("evm_snapshot", []);
+      for (const l1Addr of l1Addresses) {
+        const isDeployed = this.l1ProxyAddresses.has(l1Addr.toLowerCase());
+        if (!isDeployed) {
+          log("Fullnode", `  Temporarily deploying L1SenderProxyL2 for ${l1Addr}...`);
+          await this.deployL1SenderProxyL2(l1Addr, this.l2Provider, this.systemWallet, false);
+          await this.l2Provider.send("evm_mine", []);
+        }
+      }
+    }
 
     // Trace the transaction using debug_traceCall
     let traceResult: any;
@@ -846,8 +971,15 @@ export class L2Fullnode implements IFullnodeRpc {
     } catch (err: any) {
       log("Fullnode", `  Trace failed: ${err.message}`);
       // The tx might revert because outgoing calls are not registered yet
-      // Try to extract info from the revert
-      return [];
+      // Try to parse the error data as trace result
+      const errorData = err.info?.error?.data;
+      if (errorData && typeof errorData === "object") {
+        traceResult = errorData;
+        log("Fullnode", `  Recovered trace from error data`);
+      } else {
+        if (snapshotId) await this.l2Provider.send("evm_revert", [snapshotId]);
+        return [];
+      }
     }
 
     // Find calls to L1SenderProxyL2 contracts
@@ -856,6 +988,7 @@ export class L2Fullnode implements IFullnodeRpc {
       proxyAddress: string;
       l1Address: string;
       callData: string;
+      value: string;
     }> = [];
 
     const findOutgoingCalls = async (call: any, depth: number = 0) => {
@@ -885,12 +1018,14 @@ export class L2Fullnode implements IFullnodeRpc {
           log("Fullnode", `    Proxy: ${targetAddr}`);
           log("Fullnode", `    L1 address: ${l1Addr}`);
           log("Fullnode", `    Calldata: ${(call.input || "0x").slice(0, 10)}...`);
+          log("Fullnode", `    Value: ${call.value || "0x0"}`);
 
           outgoingCalls.push({
             l2Caller: callerAddr,
             proxyAddress: targetAddr,
             l1Address: l1Addr,
             callData: call.input || "0x",
+            value: call.value || "0x0",
           });
         }
       } catch {
@@ -906,6 +1041,12 @@ export class L2Fullnode implements IFullnodeRpc {
     };
 
     await findOutgoingCalls(traceResult);
+
+    // Revert snapshot if we temporarily deployed proxies
+    if (snapshotId) {
+      await this.l2Provider.send("evm_revert", [snapshotId]);
+      log("Fullnode", `  Reverted detection snapshot`);
+    }
 
     log("Fullnode", `  Detected ${outgoingCalls.length} outgoing call(s)`);
     return outgoingCalls;
@@ -1080,7 +1221,7 @@ export class L2Fullnode implements IFullnodeRpc {
         continue;
       }
 
-      await registry.registerReturnValue(callKey, result, { nonce: nonce++ });
+      await registry.registerReturnValue(callKey, result, { nonce: nonce++, gasPrice: 0 });
     }
 
     // Step 2: Send the L1→L2 proxy call to mempool
@@ -1414,7 +1555,7 @@ export class L2Fullnode implements IFullnodeRpc {
       // Send deploy tx to mempool (caller is responsible for mining)
       // Use pending nonce to account for unmined txs in --no-mining mode
       const nonceHex = await provider.send("eth_getTransactionCount", [systemWallet.address, "pending"]);
-      const tx = await factory.deployProxy(l1Address, { nonce: parseInt(nonceHex, 16), gasLimit: 2000000n });
+      const tx = await factory.deployProxy(l1Address, { nonce: parseInt(nonceHex, 16), gasLimit: 2000000n, gasPrice: 0 });
       log("Fullnode", `  L1SenderProxyL2 deploy tx sent for ${l1Address} → ${expectedAddress}`);
 
       // Only store the mapping if this is a canonical execution (not simulation)
@@ -1549,15 +1690,16 @@ export class L2Fullnode implements IFullnodeRpc {
     log("Fullnode", `  L1 state: ${l1StateHash.slice(0, 18)}...`);
 
     // Fetch all historical events
+    const fromBlock = this.config.l1StartBlock || 0;
     const l2BlockEvents = await this.rollupCore.queryFilter(
       this.rollupCore.filters.L2BlockProcessed(),
-      0,
+      fromBlock,
       "latest"
     );
 
     const incomingCallEvents = await this.rollupCore.queryFilter(
       this.rollupCore.filters.IncomingCallHandled(),
-      0,
+      fromBlock,
       "latest"
     );
 
@@ -1833,6 +1975,9 @@ async function main() {
         break;
       case "--rpc-port":
         config.rpcPort = parseInt(args[++i]);
+        break;
+      case "--l1-start-block":
+        config.l1StartBlock = parseInt(args[++i]);
         break;
     }
   }
