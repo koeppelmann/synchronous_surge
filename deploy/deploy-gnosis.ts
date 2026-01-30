@@ -2,7 +2,7 @@
  * Deploy NativeRollupCore + AdminProofVerifier to Gnosis Mainnet
  *
  * Based on compute-genesis-and-deploy.ts but writes gnosis-deployment.json
- * for use by startGnosis.sh.
+ * for use by tools/startGnosis.sh.
  *
  * Usage:
  *   ADMIN_PK=0x... npx tsx deploy/deploy-gnosis.ts           # dry run
@@ -305,7 +305,7 @@ async function main() {
   console.log(`Deployment Block:   ${deploymentBlock}`);
 
   console.log("\n=== Start services with: ===\n");
-  console.log(`ADMIN_PRIVATE_KEY=${ADMIN_PK} ./startGnosis.sh`);
+  console.log(`ADMIN_PRIVATE_KEY=${ADMIN_PK} ./tools/startGnosis.sh`);
 
   console.log("\n=== Verify on Blockscout ===\n");
   console.log(`forge verify-contract ${verifierAddress} \\`);

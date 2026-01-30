@@ -9,7 +9,7 @@ A minimal implementation of **Synchronous Rollups** - L2s where state is a pure 
 Start a complete local environment with a single command:
 
 ```bash
-./start.sh
+./tools/start.sh
 ```
 
 This starts:
@@ -27,7 +27,7 @@ Run against the live Gnosis Chain deployment:
 ```bash
 cp .env.example .env
 # Edit .env — set ADMIN_PRIVATE_KEY for full mode, or leave it out for read-only
-./startGnosis.sh
+./tools/startGnosis.sh
 ```
 
 **Read-only mode** (no `ADMIN_PRIVATE_KEY`): starts fullnode + frontend only — observe L2 state derived from L1 events.
@@ -57,7 +57,7 @@ Add these networks to your wallet (e.g., MetaMask, Rabby):
 ### Stop Everything
 
 ```bash
-./stop.sh
+./tools/stop.sh
 # or just Ctrl+C in the terminal running start.sh / startGnosis.sh
 ```
 
@@ -203,9 +203,9 @@ For L2 transactions with outgoing L1 calls, the builder:
 
 | Script | Description |
 |--------|-------------|
-| `start.sh` | Start local testnet (L1 Anvil + full stack) |
-| `startGnosis.sh` | Start against Gnosis mainnet (reads `.env`) |
-| `stop.sh` | Stop all running components |
+| `tools/start.sh` | Start local testnet (L1 Anvil + full stack) |
+| `tools/startGnosis.sh` | Start against Gnosis mainnet (reads `.env`) |
+| `tools/stop.sh` | Stop all running components |
 | `builder/builder.ts` | Builder HTTP server |
 | `builder/rpc-proxy.ts` | L1 RPC proxy |
 | `builder/l2-rpc-proxy.ts` | L2 RPC proxy |
@@ -234,11 +234,11 @@ npx tsx deploy/test-registry-queue.ts
 
 ```bash
 # Local testnet
-./start.sh
+./tools/start.sh
 
 # Gnosis mainnet
 cp .env.example .env   # Configure addresses and optionally ADMIN_PRIVATE_KEY
-./startGnosis.sh
+./tools/startGnosis.sh
 ```
 
 ### Run Components Manually
