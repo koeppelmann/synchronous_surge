@@ -20,12 +20,12 @@ Run a read-only L2 fullnode and dashboard to observe the Surge synchronous rollu
 
 | Contract | Address | Explorer |
 |----------|---------|----------|
-| NativeRollupCore | `0xe63008eDe0377F33f3d0fcF632Ea70B00B613E47` | [Gnosisscan](https://gnosisscan.io/address/0xe63008eDe0377F33f3d0fcF632Ea70B00B613E47) |
-| AdminProofVerifier | `0x9ce500D906C108aAF215ce1518FCBd55165a8D56` | [Gnosisscan](https://gnosisscan.io/address/0x9ce500D906C108aAF215ce1518FCBd55165a8D56) |
+| NativeRollupCore | `0x7c7aBBd57007E86323F28744808C51385e8010E4` | [Gnosisscan](https://gnosisscan.io/address/0x7c7aBBd57007E86323F28744808C51385e8010E4) |
+| AdminProofVerifier | `0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50` | [Gnosisscan](https://gnosisscan.io/address/0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50) |
 
-- **Deployment Block:** `44423798`
+- **Deployment Block:** `44428519`
 - **L2 Chain ID:** `10200200`
-- **Genesis State Root:** `0x55916077bbbf109846105e4b784e613e16678125505119658720d47ce422b3c4`
+- **Genesis State Root:** `0x473cf0cc2c7fd6e37abf75db24443096e184b9790b87d7515114729cffe2a964`
 
 ## Setup Steps
 
@@ -63,10 +63,10 @@ mkdir -p logs
 
 npx tsx fullnode/l2-fullnode.ts \
     --l1-rpc https://rpc.gnosischain.com \
-    --rollup 0xe63008eDe0377F33f3d0fcF632Ea70B00B613E47 \
+    --rollup 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
     --l2-port 9546 \
     --rpc-port 9547 \
-    --l1-start-block 44423798 \
+    --l1-start-block 44428519 \
     > logs/fullnode.log 2>&1 &
 
 echo "Fullnode starting... check logs/fullnode.log"
@@ -75,7 +75,7 @@ echo "Fullnode starting... check logs/fullnode.log"
 **What happens:**
 1. Starts an Anvil instance on port `9546` (L2 chain ID 10200200)
 2. Deploys L2 system contracts (L2CallRegistry, L1SenderProxyL2Factory)
-3. Fetches all `L2BlockProcessed` and `IncomingCallHandled` events from L1 starting at block `44423798`
+3. Fetches all `L2BlockProcessed` and `IncomingCallHandled` events from L1 starting at block `44428519`
 4. Replays each event to reconstruct the exact L2 state
 5. Starts polling L1 every 2 seconds for new events
 6. Exposes the fullnode RPC on port `9547`
@@ -100,7 +100,7 @@ Compare your fullnode's state against the L1 contract:
 
 ```bash
 # L1 contract's view of L2 state
-cast call 0xe63008eDe0377F33f3d0fcF632Ea70B00B613E47 \
+cast call 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
     "l2BlockHash()" \
     --rpc-url https://rpc.gnosischain.com
 
@@ -127,7 +127,7 @@ Open **http://localhost:8180** in your browser.
 ### 7. Configure the Dashboard
 
 The dashboard auto-detects Gnosis mode when served on port `8180`. It will:
-- Set the rollup address to `0xe63008eDe0377F33f3d0fcF632Ea70B00B613E47`
+- Set the rollup address to `0x7c7aBBd57007E86323F28744808C51385e8010E4`
 - Show Gnosisscan links for all L1 addresses and transactions
 - Display values in xDAI instead of ETH
 
@@ -219,10 +219,10 @@ Pass your preferred RPC URL with `--l1-rpc`:
 ```bash
 npx tsx fullnode/l2-fullnode.ts \
     --l1-rpc https://rpc.ankr.com/gnosis \
-    --rollup 0xe63008eDe0377F33f3d0fcF632Ea70B00B613E47 \
+    --rollup 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
     --l2-port 9546 \
     --rpc-port 9547 \
-    --l1-start-block 44423798
+    --l1-start-block 44428519
 ```
 
 ## Troubleshooting

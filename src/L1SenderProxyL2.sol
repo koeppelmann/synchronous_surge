@@ -138,7 +138,7 @@ interface IL2CallRegistry {
      * @return registered Whether the return value is registered
      * @return returnData The pre-registered return data
      */
-    function getReturnValue(bytes32 callKey) external view returns (bool registered, bytes memory returnData);
+    function getReturnValue(bytes32 callKey) external returns (bool registered, bytes memory returnData);
 }
 
 /**
@@ -151,20 +151,18 @@ contract L2CallRegistry is IL2CallRegistry {
     /// @notice The L2 system address - only it can register return values
     address public immutable systemAddress;
 
-    /// @notice Mapping from call key to registered return value
-    mapping(bytes32 => bytes) public returnValues;
+    /// @notice Queue of return values per call key (indexed by registration order)
+    mapping(bytes32 => mapping(uint256 => bytes)) public returnValues;
 
-    /// @notice Mapping to track which keys are registered
-    mapping(bytes32 => bool) public isRegistered;
+    /// @notice Number of return values registered for each call key
+    mapping(bytes32 => uint256) public callCount;
 
-    /// @notice Current execution context - which call keys are valid for this block
-    mapping(bytes32 => bool) public currentBlockKeys;
+    /// @notice Number of return values consumed (popped) for each call key
+    mapping(bytes32 => uint256) public consumed;
 
-    event ReturnValueRegistered(bytes32 indexed callKey, bytes returnData);
-    event ReturnValueConsumed(bytes32 indexed callKey);
+    event ReturnValueRegistered(bytes32 indexed callKey, uint256 index, bytes returnData);
 
     error OnlySystemAddress();
-    error AlreadyRegistered();
 
     constructor(address _systemAddress) {
         systemAddress = _systemAddress;
@@ -172,42 +170,59 @@ contract L2CallRegistry is IL2CallRegistry {
 
     /**
      * @notice Register a return value for an upcoming L2→L1 call
-     * @param callKey The unique key for the call
+     * @dev Appends to a queue — the same callKey can be registered multiple times
+     *      with different return values for repeated calls within a single tx.
+     * @param callKey The base key for the call (hash of l1Address, l2Caller, callData)
      * @param returnData The return data to provide
      */
     function registerReturnValue(bytes32 callKey, bytes calldata returnData) external {
         if (msg.sender != systemAddress) revert OnlySystemAddress();
-        if (isRegistered[callKey]) revert AlreadyRegistered();
 
-        returnValues[callKey] = returnData;
-        isRegistered[callKey] = true;
-        currentBlockKeys[callKey] = true;
+        uint256 idx = callCount[callKey];
+        returnValues[callKey][idx] = returnData;
+        callCount[callKey] = idx + 1;
 
-        emit ReturnValueRegistered(callKey, returnData);
+        emit ReturnValueRegistered(callKey, idx, returnData);
     }
 
     /**
-     * @notice Get the pre-registered return value
-     * @param callKey The unique key for the call
+     * @notice Get and consume the next pre-registered return value
+     * @dev Each call advances the consumed pointer, so repeated calls
+     *      with the same key get sequential return values.
+     * @param callKey The base key for the call
      */
-    function getReturnValue(bytes32 callKey) external view override returns (bool registered, bytes memory returnData) {
-        registered = isRegistered[callKey];
+    function getReturnValue(bytes32 callKey) external override returns (bool registered, bytes memory returnData) {
+        uint256 idx = consumed[callKey];
+        registered = idx < callCount[callKey];
         if (registered) {
-            returnData = returnValues[callKey];
+            returnData = returnValues[callKey][idx];
+            consumed[callKey] = idx + 1;
         }
     }
 
     /**
-     * @notice Clear return values after block execution (optional cleanup)
+     * @notice Check if there are unconsumed return values for a call key
+     * @param callKey The base key for the call
+     */
+    function isRegistered(bytes32 callKey) external view returns (bool) {
+        return consumed[callKey] < callCount[callKey];
+    }
+
+    /**
+     * @notice Clear return values after block execution
      * @param callKeys The keys to clear
      */
     function clearReturnValues(bytes32[] calldata callKeys) external {
         if (msg.sender != systemAddress) revert OnlySystemAddress();
 
         for (uint256 i = 0; i < callKeys.length; i++) {
-            delete returnValues[callKeys[i]];
-            delete isRegistered[callKeys[i]];
-            delete currentBlockKeys[callKeys[i]];
+            bytes32 key = callKeys[i];
+            uint256 count = callCount[key];
+            for (uint256 j = 0; j < count; j++) {
+                delete returnValues[key][j];
+            }
+            delete callCount[key];
+            delete consumed[key];
         }
     }
 }

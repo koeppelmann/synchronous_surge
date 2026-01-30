@@ -57,6 +57,7 @@ export interface L2FullnodeConfig {
   l2ChainId: number;
   systemPrivateKey: string; // System address private key
   l1StartBlock: number;     // L1 block to start scanning events from (0 = genesis)
+  ignoreStateMismatch: boolean; // Skip prevBlockHash checks during replay (for testing with changed L2 system contracts)
 }
 
 const DEFAULT_CONFIG: L2FullnodeConfig = {
@@ -69,6 +70,7 @@ const DEFAULT_CONFIG: L2FullnodeConfig = {
   // This is the "sequencer" that executes all L2 operations
   systemPrivateKey: process.env.SYSTEM_PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000001",
   l1StartBlock: parseInt(process.env.L1_START_BLOCK || "0"),
+  ignoreStateMismatch: false,
 };
 
 // ============ Constants ============
@@ -96,7 +98,7 @@ const L1_SENDER_PROXY_L2_ABI = [
 // L2CallRegistry ABI
 const L2_CALL_REGISTRY_ABI = [
   "function registerReturnValue(bytes32 callKey, bytes calldata returnData)",
-  "function getReturnValue(bytes32 callKey) view returns (bool registered, bytes memory returnData)",
+  "function getReturnValue(bytes32 callKey) returns (bool registered, bytes memory returnData)",
   "function clearReturnValues(bytes32[] calldata callKeys)",
   "function isRegistered(bytes32 callKey) view returns (bool)",
 ];
@@ -739,23 +741,22 @@ export class L2Fullnode implements IFullnodeRpc {
       this.systemWallet
     );
 
-    // Check if already registered
-    const alreadyRegistered = await registry.isRegistered(callKey);
-    if (alreadyRegistered) {
-      log("Fullnode", `  Already registered, skipping`);
-      return { callKey, txHash: "0x0" };
-    }
+    let nonce = parseInt(
+      await this.l2Provider.send("eth_getTransactionCount", [
+        this.systemWallet.address, "pending"
+      ]), 16
+    );
 
-    const nonce = await this.l2Provider.send("eth_getTransactionCount", [
-      this.systemWallet.address, "pending"
-    ]);
+    // Clear any stale entry for this key first
+    await registry.clearReturnValues([callKey], { nonce: nonce++, gasPrice: 0 });
+
     const tx = await registry.registerReturnValue(
       callKey,
       params.returnData || "0x",
-      { nonce: parseInt(nonce, 16), gasPrice: 0 }
+      { nonce: nonce, gasPrice: 0 }
     );
 
-    // Mine the registration tx
+    // Mine clear + registration
     await this.l2Provider.send("evm_mine", []);
     const receipt = await tx.wait();
 
@@ -813,14 +814,27 @@ export class L2Fullnode implements IFullnodeRpc {
     }
     // Proxy deploy txs are in the mempool — they'll be mined with registrations + L2 tx
 
-    // Step 1: Send all registration txs to the mempool (NO mining yet).
-    // The registration + L2 tx will all be mined in a single block
-    // to produce a deterministic state root.
+    // Step 1: Clear any stale registry entries for these call keys, then register new values.
+    // This ensures repeated calls to the same L1 function get fresh return values.
     let nonce = parseInt(
       await this.l2Provider.send("eth_getTransactionCount", [
         this.systemWallet.address, "pending"
       ]), 16
     );
+
+    // Compute all call keys and clear stale entries
+    const allCallKeys = outgoingCalls.map(call =>
+      ethers.keccak256(
+        ethers.solidityPacked(
+          ["address", "address", "bytes"],
+          [call.target, call.from, call.data]
+        )
+      )
+    );
+    const uniqueCallKeys = [...new Set(allCallKeys)];
+    // Clear in mempool (will be mined with registrations)
+    await registry.clearReturnValues(uniqueCallKeys, { nonce: nonce++, gasPrice: 0 });
+    log("Fullnode", `  Clearing ${uniqueCallKeys.length} stale registry key(s)`);
 
     for (let i = 0; i < outgoingCalls.length; i++) {
       const call = outgoingCalls[i];
@@ -840,13 +854,6 @@ export class L2Fullnode implements IFullnodeRpc {
       log("Fullnode", `    Calldata: ${call.data.slice(0, 10)}...`);
       log("Fullnode", `    Return: ${result.slice(0, 42)}${result.length > 42 ? '...' : ''}`);
       log("Fullnode", `    Call key: ${callKey}`);
-
-      // Check if already registered (e.g. from a previous failed attempt)
-      const alreadyRegistered = await registry.isRegistered(callKey);
-      if (alreadyRegistered) {
-        log("Fullnode", `    Already registered, skipping`);
-        continue;
-      }
 
       // Send to mempool — do NOT mine yet.
       // Use very high gasPrice to ensure Anvil orders registrations before user txs.
@@ -902,10 +909,6 @@ export class L2Fullnode implements IFullnodeRpc {
 
     const newStateRoot = await this.nativerollup_getStateRoot();
     log("Fullnode", `  New state root: ${newStateRoot}`);
-
-    // No cleanup needed — registered values are keyed by (l1Address, l2Caller, callData)
-    // and won't conflict with future calls unless the exact same call is made again,
-    // at which point they'll be consumed and new values registered.
 
     return {
       success: receipt.status === 1,
@@ -1200,7 +1203,21 @@ export class L2Fullnode implements IFullnodeRpc {
       ]), 16
     );
 
-    // Step 1: Send all registration txs to mempool (NO mining yet)
+    // Step 1: Clear stale entries and register new return values
+    const allCallKeys = outgoingCalls.map(call =>
+      ethers.keccak256(
+        ethers.solidityPacked(
+          ["address", "address", "bytes"],
+          [call.target, call.from, call.data]
+        )
+      )
+    );
+    if (allCallKeys.length > 0) {
+      const uniqueCallKeys = [...new Set(allCallKeys)];
+      await registry.clearReturnValues(uniqueCallKeys, { nonce: nonce++, gasPrice: 0 });
+      log("Fullnode", `  Clearing ${uniqueCallKeys.length} stale registry key(s)`);
+    }
+
     for (let i = 0; i < outgoingCalls.length; i++) {
       const call = outgoingCalls[i];
       const result = outgoingCallResults[i] || "0x";
@@ -1214,12 +1231,6 @@ export class L2Fullnode implements IFullnodeRpc {
 
       log("Fullnode", `  Registering outgoing call ${i}: ${call.from} → ${call.target}`);
       log("Fullnode", `    Call key: ${callKey}`);
-
-      const alreadyRegistered = await registry.isRegistered(callKey);
-      if (alreadyRegistered) {
-        log("Fullnode", `    Already registered, skipping`);
-        continue;
-      }
 
       await registry.registerReturnValue(callKey, result, { nonce: nonce++, gasPrice: 0 });
     }
@@ -1736,7 +1747,10 @@ export class L2Fullnode implements IFullnodeRpc {
 
         // Check if this event applies to our current state
         if (prevBlockHash.toLowerCase() !== prevState.toLowerCase()) {
-          continue; // Skip, not applicable to current state
+          if (!this.config.ignoreStateMismatch) {
+            continue; // Skip, not applicable to current state
+          }
+          log("Fullnode", `  State mismatch (ignored): expected ${prevBlockHash.slice(0, 18)}..., have ${prevState.slice(0, 18)}...`);
         }
 
         log("Fullnode", `  Replaying L2BlockProcessed from L1 #${blockNumber}`);
@@ -1763,7 +1777,10 @@ export class L2Fullnode implements IFullnodeRpc {
 
         // Check if this event applies to our current state
         if (prevBlockHash.toLowerCase() !== prevState.toLowerCase()) {
-          continue; // Skip, not applicable to current state
+          if (!this.config.ignoreStateMismatch) {
+            continue; // Skip, not applicable to current state
+          }
+          log("Fullnode", `  State mismatch (ignored): expected ${prevBlockHash.slice(0, 18)}..., have ${prevState.slice(0, 18)}...`);
         }
 
         log("Fullnode", `  Replaying IncomingCallHandled from L1 #${blockNumber}`);
@@ -1978,6 +1995,9 @@ async function main() {
         break;
       case "--l1-start-block":
         config.l1StartBlock = parseInt(args[++i]);
+        break;
+      case "--ignore-state-mismatch":
+        config.ignoreStateMismatch = true;
         break;
     }
   }
