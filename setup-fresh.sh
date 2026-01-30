@@ -117,7 +117,7 @@ start_fullnode() {
 
     mkdir -p logs
 
-    npx tsx fullnode/l2-fullnode.ts \
+    npx tsx l2fullnode/l2-fullnode.ts \
         --l1-rpc http://localhost:$L1_PORT \
         --rollup $ROLLUP_ADDRESS \
         --l2-port $L2_EVM_PORT \
@@ -151,7 +151,7 @@ start_fullnode() {
 start_builder() {
     log "Starting Builder (new architecture)..."
 
-    npx tsx scripts/builder.ts \
+    npx tsx builder/builder.ts \
         --l1-rpc http://localhost:$L1_PORT \
         --fullnode http://localhost:$FULLNODE_RPC_PORT \
         --rollup $ROLLUP_ADDRESS \
@@ -176,7 +176,7 @@ start_builder() {
 start_proxies() {
     log "Starting L1 RPC Proxy on port $L1_PROXY_PORT..."
 
-    npx tsx scripts/rpc-proxy.ts \
+    npx tsx builder/rpc-proxy.ts \
         --port $L1_PROXY_PORT \
         --rpc http://localhost:$L1_PORT \
         --builder http://localhost:$BUILDER_PORT \
@@ -199,7 +199,7 @@ start_proxies() {
 
     log "Starting L2 RPC Proxy on port $L2_PROXY_PORT..."
 
-    npx tsx scripts/l2-rpc-proxy.ts \
+    npx tsx builder/l2-rpc-proxy.ts \
         --port $L2_PROXY_PORT \
         --fullnode http://localhost:$FULLNODE_RPC_PORT \
         --builder http://localhost:$BUILDER_PORT \

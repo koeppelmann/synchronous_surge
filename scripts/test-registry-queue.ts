@@ -162,7 +162,7 @@ async function deployRollup(l1: JsonRpcProvider): Promise<string> {
 async function startFullnodeAndBuilder(rollupAddr: string): Promise<void> {
   log("Starting builder fullnode...");
   const fn = spawn("npx", [
-    "tsx", "fullnode/l2-fullnode.ts",
+    "tsx", "l2fullnode/l2-fullnode.ts",
     "--l1-rpc", `http://localhost:${L1_PORT}`,
     "--rollup", rollupAddr,
     "--l2-port", BUILDER_L2_PORT.toString(),
@@ -176,7 +176,7 @@ async function startFullnodeAndBuilder(rollupAddr: string): Promise<void> {
 
   log("Starting builder...");
   const b = spawn("npx", [
-    "tsx", "scripts/builder.ts",
+    "tsx", "builder/builder.ts",
     "--l1-rpc", `http://localhost:${L1_PORT}`,
     "--fullnode", `http://localhost:${BUILDER_FULLNODE_PORT}`,
     "--rollup", rollupAddr,

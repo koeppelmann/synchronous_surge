@@ -4,20 +4,43 @@ A minimal implementation of **Synchronous Rollups** - L2s where state is a pure 
 
 ## Quick Start
 
-Start the complete Synchronous Rollup environment with a single command:
+### Local Testnet
+
+Start a complete local environment with a single command:
 
 ```bash
-cd synchronous_surge
 ./start.sh
 ```
 
 This starts:
 - **L1 Anvil** (port 8545) - Local Ethereum chain
 - **L2 Fullnode** (port 9546) - Deterministic L2 derived from L1
-- **Builder** (port 3200) - Processes L1→L2 deposits
+- **Builder** (port 3200) - Processes transactions and submits proofs
 - **L1 RPC Proxy** (port 8546) - Routes wallet transactions through builder
 - **L2 RPC Proxy** (port 9548) - Routes L2 transactions through builder
 - **Frontend** (port 8080) - Web UI for deposits/withdrawals
+
+### Gnosis Mainnet
+
+Run against the live Gnosis Chain deployment:
+
+```bash
+cp .env.example .env
+# Edit .env — set ADMIN_PRIVATE_KEY for full mode, or leave it out for read-only
+./startGnosis.sh
+```
+
+**Read-only mode** (no `ADMIN_PRIVATE_KEY`): starts fullnode + frontend only — observe L2 state derived from L1 events.
+
+**Full mode** (with `ADMIN_PRIVATE_KEY`): also starts builder + RPC proxies for submitting transactions.
+
+| Service | Port | Description |
+|---------|------|-------------|
+| L2 Fullnode RPC | 9547 | Read-only L2 state |
+| Frontend | 8180 | Web UI |
+| L1 RPC Proxy | 8646 | Use in wallet (full mode) |
+| L2 RPC Proxy | 9648 | Use in wallet (full mode) |
+| Builder API | 3200 | Transaction submission (full mode) |
 
 ### Wallet Setup
 
@@ -25,25 +48,17 @@ Add these networks to your wallet (e.g., MetaMask, Rabby):
 
 | Network | Chain ID | RPC URL |
 |---------|----------|---------|
-| L1 (via proxy) | 31337 | `http://localhost:8546` |
-| L2 (via proxy) | 10200200 | `http://localhost:9548` |
+| L1 (local) | 31337 | `http://localhost:8546` |
+| L1 (Gnosis) | 100 | `http://localhost:8646` |
+| L2 | 10200200 | `http://localhost:9548` (local) or `http://localhost:9648` (Gnosis) |
 
-**Important:** Use the proxy ports (8546/9548), not the direct RPC ports, so transactions are routed through the builder.
-
-### Test the Flow
-
-1. Open http://localhost:8080 in your browser
-2. Connect your wallet to L1 (Chain ID 31337, port 8546)
-3. The default Anvil account has 10,000 ETH
-4. Enter an amount and click "Deposit to L2"
-5. Switch your wallet to L2 (Chain ID 10200200, port 9548)
-6. Your deposited ETH appears on L2
+**Important:** Use the proxy ports, not the direct RPC ports, so transactions are routed through the builder.
 
 ### Stop Everything
 
 ```bash
 ./stop.sh
-# or just Ctrl+C in the terminal running start.sh
+# or just Ctrl+C in the terminal running start.sh / startGnosis.sh
 ```
 
 ## Overview
@@ -59,16 +74,17 @@ L2 State = f(Previous L2 State, Input CallData, L1 Calls)
 Every L2 block:
 1. Takes previous L2 state + input calldata
 2. Computes new L2 state deterministically
-3. May trigger outgoing L1 calls
+3. May trigger outgoing L1 calls (with return values fed back to L2)
 4. Is proven and verified atomically in a single transaction
 
 ### Key Features
 
 - **Instant Finality**: No withdrawal delays - state is proven immediately
-- **L2→L1 Calls**: L2 contracts can call L1 contracts synchronously
+- **L2→L1 Calls**: L2 contracts can call L1 contracts synchronously and use return values
 - **L1→L2 Calls**: L1 contracts can call L2 contracts via pre-registered responses
 - **Proper `msg.sender`**: Each address has a deterministic proxy for correct caller identity
 - **Real State Roots**: L1 commitment always matches actual L2 state root
+- **Queue-Based Call Registry**: Supports repeated identical calls with different return values
 - **Pluggable Verification**: Replace `AdminProofVerifier` with ZK or TEE verifier for production
 
 ## Architecture
@@ -83,7 +99,7 @@ Every L2 block:
 │  │                     │    │  (AdminProofVerifier)  │     │
 │  │  - l2BlockHash      │    └────────────────────────┘     │
 │  │  - l2BlockNumber    │                                   │
-│  │  - processSingleTxOnL2│                                   │
+│  │  - processSingleTxOnL2                                  │
 │  │  - registerIncoming │                                   │
 │  │  - handleIncoming   │                                   │
 │  └──────────┬──────────┘                                   │
@@ -98,25 +114,29 @@ Every L2 block:
 └─────────────────────────────────────────────────────────────┘
                               │
                      ┌────────┴────────┐
-                     │   Sequencer     │
+                     │    Builder      │
                      │  (TypeScript)   │
-                     │  - Watch L1     │
-                     │  - Replay on L2 │
+                     │  - Detect calls │
+                     │  - Simulate L1  │
+                     │  - Submit proof │
                      └────────┬────────┘
                               │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     L2 (Fresh EVM Chain)                    │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  L2 State is a PURE FUNCTION of L1 actions                  │
-│                                                             │
-│  - L1SenderProxy: Deterministic address for each L1 caller │
-│  - Contract storage: Synced via sequencer replay           │
-│  - State root: Committed on L1 after each transition       │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────┐          │          ┌──────────────────┐
+│   L2 Fullnode    │◀─────────┘          │   L2 Fullnode    │
+│   (read-only)    │                     │  (builder's)     │
+│   Derives state  │                     │  For simulation  │
+│   from L1 events │                     │  and discovery   │
+└──────────────────┘                     └──────────────────┘
 ```
+
+### Dual Fullnode Architecture
+
+The system runs two independent L2 fullnodes:
+
+1. **Read-only fullnode** — Derives L2 state purely by replaying L1 events. This is what observers and the frontend connect to.
+2. **Builder's private fullnode** — Used by the builder for transaction simulation, outgoing call detection, and state root computation before submitting to L1.
+
+Both fullnodes independently derive identical state from L1 events.
 
 ## Contracts
 
@@ -124,59 +144,73 @@ Every L2 block:
 |----------|-------------|
 | `NativeRollupCore` | Main rollup contract - tracks L2 state, processes blocks, executes L1 calls |
 | `L2SenderProxy` | Minimal proxy deployed per L2 address for proper `msg.sender` on L1 |
+| `L1SenderProxyL2` | L2-side proxy for L1 addresses, routes calls through the call registry |
+| `L2CallRegistry` | Queue-based registry mapping L2→L1 call keys to pre-registered return values |
+| `L1SenderProxyL2Factory` | Factory for deploying L1 sender proxies on L2 |
 | `IProofVerifier` | Interface for proof verification (ZK, TEE, or admin signature) |
 | `AdminProofVerifier` | POC verifier using admin signatures (replace for production) |
-| `SyncedCounter` | Example of bidirectional L1↔L2 synchronized state |
+
+### L2CallRegistry (Queue-Based)
+
+When an L2 contract calls an L1 contract, the return value must be known in advance. The `L2CallRegistry` stores these pre-registered return values in a queue per call key (`keccak256(l1Address, l2Caller, callData)`):
+
+- **`registerReturnValue(key, data)`** — Appends a return value to the queue for a call key
+- **`getReturnValue(key)`** — Consumes the next return value from the queue (FIFO)
+- **`clearReturnValues(keys)`** — Clears stale entries before re-registering (prevents stale data)
+
+This design supports:
+- Updated return values across transactions (clear + re-register)
+- Multiple identical calls within one transaction (each gets the next queued value)
 
 ## Components
 
-### Fullnode (`fullnode/`)
+### Fullnode (`l2fullnode/l2-fullnode.ts`)
 
 The L2 Fullnode deterministically syncs L2 state from L1. It:
 - Watches L1 for `L2BlockProcessed` and `IncomingCallHandled` events
-- Replays all state transitions on L2
-- Maintains the invariant: L2 state root == l2BlockHash on L1
+- Replays all state transitions on a local Anvil instance
+- Deploys L2 system contracts (L2CallRegistry, L1SenderProxyL2Factory) at genesis
+- Maintains the invariant: L2 state root == `l2BlockHash` on L1
 
-```bash
-cd fullnode && npm install
-npx tsx index.ts
+### Builder (`builder/builder.ts`)
+
+The Builder is an HTTP server that processes transactions:
+
+**POST `/submit`** — Submit a transaction for processing
+```json
+{
+  "signedTx": "0x...",
+  "sourceChain": "L2",
+  "hints": { "l1TargetAddress": "0x..." }
+}
 ```
 
-### Builder (`builder/`)
+**GET `/status`** — Check builder and sync status
 
-The Builder handles two types of L2 state transitions:
+For L2 transactions with outgoing L1 calls, the builder:
+1. Detects outgoing L2→L1 calls by tracing the transaction
+2. Simulates each L1 call to get return values
+3. Pre-registers return values in the L2CallRegistry
+4. Executes the L2 transaction (outgoing calls now succeed via registry)
+5. Submits `processSingleTxOnL2` to L1 with proof
 
-**1. L2 EOA Transactions:**
-```bash
-npx tsx index.ts l2-tx <from> <to> [value] [data]
+### RPC Proxies
 
-# Example: Transfer 1 ETH on L2
-npx tsx index.ts l2-tx 0xf39F... 0x7099... 1000000000000000000
-```
-
-**2. L1→L2 Contract Calls:**
-```bash
-npx tsx index.ts l1-to-l2 <l1Caller> <l2Target> [callData]
-
-# Example: L1SyncedCounter calls L2SyncedCounter.setValue(42)
-npx tsx index.ts l1-to-l2 0xd30b... 0xe7f1... 0x55241077...00002a
-```
-
-**Check Status:**
-```bash
-npx tsx index.ts status
-```
+- **`builder/rpc-proxy.ts`** — L1 RPC proxy, intercepts `eth_sendRawTransaction` and routes through builder
+- **`builder/l2-rpc-proxy.ts`** — L2 RPC proxy, intercepts L2 transactions and routes through builder
 
 ## Scripts
 
 | Script | Description |
 |--------|-------------|
-| `start.sh` | **Start everything** - L1, contracts, fullnode, builder, proxies, UI |
+| `start.sh` | Start local testnet (L1 Anvil + full stack) |
+| `startGnosis.sh` | Start against Gnosis mainnet (reads `.env`) |
 | `stop.sh` | Stop all running components |
-| `fullnode/deterministic-fullnode.ts` | L2 Fullnode - derives state from L1 events |
-| `scripts/deterministic-builder.ts` | Builder - handles L1→L2 deposits and L2 transactions |
-| `scripts/rpc-proxy.ts` | L1 RPC proxy - routes transactions through builder |
-| `scripts/l2-rpc-proxy.ts` | L2 RPC proxy - routes L2 transactions through builder |
+| `builder/builder.ts` | Builder HTTP server |
+| `builder/rpc-proxy.ts` | L1 RPC proxy |
+| `builder/l2-rpc-proxy.ts` | L2 RPC proxy |
+| `scripts/deploy-gnosis.ts` | Deploy contracts to Gnosis mainnet |
+| `scripts/test-registry-queue.ts` | End-to-end test for L2CallRegistry queue fix |
 
 ## Usage
 
@@ -189,80 +223,78 @@ forge build
 ### Test
 
 ```bash
+# Solidity tests
 forge test
+
+# End-to-end registry queue test (starts local L1 + fullnode + builder)
+npx tsx scripts/test-registry-queue.ts
 ```
 
-### Run Full Stack (Recommended)
+### Run Full Stack
 
 ```bash
+# Local testnet
 ./start.sh
+
+# Gnosis mainnet
+cp .env.example .env   # Configure addresses and optionally ADMIN_PRIVATE_KEY
+./startGnosis.sh
 ```
 
-This script:
-1. Calculates the deterministic genesis hash
-2. Starts L1 Anvil (auto-mine mode)
-3. Deploys NativeRollupCore with correct genesis
-4. Starts the deterministic fullnode
-5. Starts the builder service
-6. Starts RPC proxies for wallet integration
-7. Starts the frontend UI
-
 ### Run Components Manually
-
-If you prefer to run components separately:
 
 ```bash
 # Terminal 1: Start L1
 anvil --port 8545 --chain-id 31337
 
 # Terminal 2: Start L2 Fullnode (after deploying contracts)
-npx tsx fullnode/deterministic-fullnode.ts \
+npx tsx l2fullnode/l2-fullnode.ts \
     --l1-rpc http://localhost:8545 \
     --rollup <ROLLUP_ADDRESS> \
-    --port 9546
+    --l2-port 9546 \
+    --rpc-port 9547
 
 # Terminal 3: Start Builder
-npx tsx scripts/deterministic-builder.ts \
+npx tsx builder/builder.ts \
     --l1-rpc http://localhost:8545 \
-    --fullnode http://localhost:9546 \
+    --fullnode http://localhost:9547 \
     --rollup <ROLLUP_ADDRESS> \
     --admin-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
     --port 3200
 
 # Terminal 4: Start RPC Proxies
-npx tsx scripts/rpc-proxy.ts --rpc http://localhost:8545 --builder http://localhost:3200 --port 8546
-npx tsx scripts/l2-rpc-proxy.ts --rpc http://localhost:9546 --builder http://localhost:3200 --port 9548
+npx tsx builder/rpc-proxy.ts --rpc http://localhost:8545 --builder http://localhost:3200 --port 8546
+npx tsx builder/l2-rpc-proxy.ts --rpc http://localhost:9547 --builder http://localhost:3200 --port 9548
 ```
 
-### Deploy
+### Deploy to Gnosis
 
 ```bash
-# Set environment variables
-export PRIVATE_KEY=0x...
-export ADMIN_ADDRESS=0x...  # Who can sign proofs
-export OWNER_ADDRESS=0x...  # Who can upgrade verifier
-
-# Deploy to Gnosis Chain
-forge script script/Deploy.s.sol --rpc-url https://rpc.gnosischain.com --broadcast
+ADMIN_PK=0x... npx tsx scripts/deploy-gnosis.ts --deploy
 ```
 
-## Bidirectional L1↔L2 Sync
+This deploys `NativeRollupCore` and `AdminProofVerifier` to Gnosis Chain and writes `gnosis-deployment.json`.
 
-### L2→L1: Outgoing Calls (processSingleTxOnL2)
+## Bidirectional L1↔L2 Composability
 
-L2 contracts include `OutgoingCall[]` in state transitions. The NativeRollupCore executes these calls on L1 via deterministic proxies.
+### L2→L1: Outgoing Calls
+
+L2 contracts can call L1 contracts synchronously. The builder detects these calls, simulates them on L1, and pre-registers the return values so the L2 execution succeeds:
 
 ```solidity
-nativeRollupCore.processSingleTxOnL2{value: depositAmount}(
-    rawTransaction,       // RLP-encoded signed L2 transaction
-    outgoingCalls,        // Array of L1 calls triggered by L2 execution
-    expectedResults,      // Expected return data from L1 calls
-    finalStateHash,       // Final L2 state after all calls
-    proof                 // Proof of valid state transition chain
-);
+// L2 contract calls an L1 contract through its proxy
+uint256 value = ITarget(l2ProxyOfL1Contract).get();
+// 'value' contains the actual L1 return value
 ```
 
-### L1→L2: Incoming Call Registry (registerIncomingCall + handleIncomingCall)
+Under the hood:
+1. Builder traces the L2 tx, finds calls to L1SenderProxyL2 contracts
+2. Simulates each call on L1 to get return values
+3. Registers return values in L2CallRegistry (queue-based)
+4. Executes the L2 tx — proxy reads return value from registry
+5. Submits to L1 with outgoing calls — L1 verifies results match
+
+### L1→L2: Incoming Calls
 
 L1 contracts can call L2 contracts by:
 
@@ -272,20 +304,13 @@ nativeRollupCore.registerIncomingCall(
     l2Address,           // L2 contract being called
     currentStateHash,    // Current L2 state (must match l2BlockHash)
     callData,            // The call to simulate
-    IncomingCallResponse({
-        preOutgoingCallsStateHash: newState,  // L2 state after call
-        outgoingCalls: [],                    // Any L2→L1 calls triggered
-        expectedResults: [],
-        returnValue: abi.encode(result),      // Return value for L1 caller
-        finalStateHash: newState
-    }),
+    response,            // Pre-computed L2 response with state transition
     proof                // Admin signature (or ZK proof in production)
 );
 ```
 
 2. **L1 contract calls L2 proxy**:
 ```solidity
-// L2Proxy.fallback() calls NativeRollupCore.handleIncomingCall()
 (bool success, bytes memory result) = l2Proxy.call(callData);
 ```
 
@@ -293,13 +318,31 @@ nativeRollupCore.registerIncomingCall(
 
 **Critical Invariant**: The `l2BlockHash` on L1 always matches the actual L2 state root.
 
-The L1→L2 executor flow ensures this:
-1. Execute L2 transaction first (via impersonation on test chain)
-2. Get actual L2 state root from `block.stateRoot`
-3. Use that exact state root as the commitment when registering on L1
-4. Execute L1 transaction
+The builder ensures this by:
+1. Executing the L2 transaction on its private fullnode
+2. Reading the actual state root from the L2 EVM
+3. Submitting that exact state root as the commitment to L1
+4. The read-only fullnode independently derives the same state by replaying L1 events
 
-This ensures L1 and L2 state are always consistent.
+## Current Deployment
+
+**Gnosis Mainnet (January 2026):**
+
+| Contract | Address | Blockscout |
+|----------|---------|------------|
+| NativeRollupCore | `0x7c7aBBd57007E86323F28744808C51385e8010E4` | [View](https://gnosis.blockscout.com/address/0x7c7aBBd57007E86323F28744808C51385e8010E4) |
+| AdminProofVerifier | `0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50` | [View](https://gnosis.blockscout.com/address/0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50) |
+
+**Deployment Details:**
+- Deployment Block: `44428519`
+- Genesis State Root: `0x473cf0cc2c7fd6e37abf75db24443096e184b9790b87d7515114729cffe2a964`
+- Admin/Owner: `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1`
+- L2 Chain ID: `10200200`
+- Compiler: solc 0.8.27, EVM: cancun
+
+**Local Testnet (via `start.sh`):**
+
+Contracts are deployed fresh each time. The NativeRollupCore address is printed in the startup output.
 
 ## L2 Proxy Address Computation
 
@@ -313,121 +356,32 @@ proxyAddress = CREATE2(
 )
 ```
 
-### L1SenderProxy (for L1 addresses calling L2)
+### L1SenderProxyL2 (for L1 addresses calling L2)
 
-```typescript
-// Computed deterministically (not deployed, just impersonated)
-const hash = keccak256(
-    AbiCoder.defaultAbiCoder().encode(
-        ["string", "address"],
-        ["NativeRollup.L1SenderProxy.v1", l1Address]
-    )
-);
-const l1ProxyOnL2 = "0x" + hash.slice(-40);
+```solidity
+// Deployed by L1SenderProxyL2Factory via CREATE2
+proxyAddress = CREATE2(
+    salt: keccak256(abi.encode(l1Address)),
+    bytecode: L1SenderProxyL2(l1Address, callRegistry)
+)
 ```
 
-## Example: SyncedCounter
+## Configuration
 
-The `SyncedCounter` example demonstrates bidirectional sync:
-
-```
-┌─────────────────────┐           ┌─────────────────────┐
-│   L1SyncedCounter   │           │   L2SyncedCounter   │
-│                     │           │                     │
-│   value: 6          │◀─────────▶│   value: 6          │
-│   l2Proxy: 0x...    │           │   l1Contract: 0x... │
-└─────────────────────┘           └─────────────────────┘
-        │                                   │
-        │ setValue(6)                       │ setValue(6)
-        ▼                                   ▼
-   Calls L2Proxy  ──────────────────▶  Called by L1Proxy
-   (registerIncomingCall first)        (impersonated)
-```
-
-**Deployed Addresses:**
-- L1SyncedCounter: `0xd30bF3219A0416602bE8D482E0396eF332b0494E`
-- L2SyncedCounter: `0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512`
-
-## Sequencer
-
-The sequencer (`sequencer/index.ts`) watches L1 for events and replays on L2:
-
-### Events Watched
-
-1. **`L2BlockProcessed`**: L2→L1 flow via `processSingleTxOnL2`
-2. **`IncomingCallHandled`**: L1→L2 flow via proxy calls
-
-### L2 Replay
-
-For each event, the sequencer:
-1. Determines the L1 caller (via `debug_traceTransaction`)
-2. Computes the L1 caller's proxy address on L2
-3. Impersonates that proxy on L2 (Anvil only)
-4. Executes the same call on L2
-
-```typescript
-// Compute L1 caller's proxy on L2
-const l2ProxyOfL1Caller = "0x" + keccak256(
-    encode(["string", "address"], ["NativeRollup.L1SenderProxy.v1", l1Caller])
-).slice(-40);
-
-// Impersonate and execute
-await l2Provider.send("anvil_impersonateAccount", [l2ProxyOfL1Caller]);
-await l2Signer.sendTransaction({ to: l2Address, data: callData });
-```
-
-## Current Deployment
-
-**Gnosis Mainnet (January 2026):**
-
-| Contract | Address | Gnosisscan | Blockscout |
-|----------|---------|------------|------------|
-| NativeRollupCore | `0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d` | [View](https://gnosisscan.io/address/0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d#code) | [View](https://gnosis.blockscout.com/address/0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d) |
-| AdminProofVerifier | `0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C` | [View](https://gnosisscan.io/address/0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C#code) | [View](https://gnosis.blockscout.com/address/0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C) |
-
-**Deployment Details:**
-- Genesis Hash: `0x0000000000000000000000000000000000000000000000000000000000000000` (matches Anvil block 0)
-- Admin/Owner: `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1`
-- Compiler: solc 0.8.27
-- EVM Version: cancun
-
-**Local Testnet (via start.sh):**
-
-Contracts are deployed fresh each time. The NativeRollupCore address is printed in the startup output.
-
-**Service Ports:**
-
-| Service | Port | Description |
-|---------|------|-------------|
-| L1 RPC (direct) | 8545 | Direct Anvil access |
-| L1 RPC (proxy) | 8546 | **Use this in wallet** - routes through builder |
-| L2 RPC (direct) | 9546 | Direct fullnode access |
-| L2 RPC (proxy) | 9548 | **Use this in wallet** - routes through builder |
-| Builder API | 3200 | Builder status and transaction submission |
-| Frontend | 8080 | Web UI for deposits/withdrawals |
-
-**Configuration:**
-- L1 Chain ID: `31337`
-- L2 Chain ID: `10200200`
-- L2 System Address: `0x1000000000000000000000000000000000000001` (10B ETH at genesis)
-
-## Test Accounts
-
-| Role | Address | Private Key |
-|------|---------|-------------|
-| Admin | `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1` | `0xf2024347d89be67338b62344010fb2ebc5db60cad2ff591a92a30b8215f87f22` |
-| Deployer | `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266` | `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80` |
-
-## Running L1→L2 Executor
+### `.env` file (for Gnosis deployment)
 
 ```bash
-# Via L1SyncedCounter (indirect proxy call)
-cd synchronous_surge
-npx tsx scripts/l1-to-l2-executor.ts 42
-
-# Direct proxy call from arbitrary L1 address
-npx tsx scripts/direct-proxy-call.ts 0x7B2e78D4dFaABA045A167a70dA285E30E8FcA196 7
+cp .env.example .env
 ```
+
+See `.env.example` for all available options. Key settings:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ADMIN_PRIVATE_KEY` | No | Admin key for builder (omit for read-only mode) |
+| `ROLLUP_ADDRESS` | Yes | NativeRollupCore contract address |
+| `DEPLOYMENT_BLOCK` | Yes | Block number of contract deployment |
+| `L1_RPC` | No | L1 RPC URL (default: `https://rpc.gnosischain.com`) |
 
 ## Production Deployment
 

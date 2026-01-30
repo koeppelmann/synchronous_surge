@@ -150,7 +150,7 @@ start_fullnode() {
     log "  L2 EVM port: $L2_EVM_PORT"
     log "  Fullnode RPC port: $FULLNODE_RPC_PORT"
 
-    npx tsx fullnode/l2-fullnode.ts \
+    npx tsx l2fullnode/l2-fullnode.ts \
         --l1-rpc http://localhost:$L1_PORT \
         --rollup $ROLLUP_ADDRESS \
         --l2-port $L2_EVM_PORT \
@@ -182,7 +182,7 @@ start_builder_fullnode() {
     log "  L2 EVM port: $BUILDER_L2_PORT"
     log "  Fullnode RPC port: $BUILDER_FULLNODE_PORT"
 
-    npx tsx fullnode/l2-fullnode.ts \
+    npx tsx l2fullnode/l2-fullnode.ts \
         --l1-rpc http://localhost:$L1_PORT \
         --rollup $ROLLUP_ADDRESS \
         --l2-port $BUILDER_L2_PORT \
@@ -212,7 +212,7 @@ start_builder() {
     log "Starting Builder on port $BUILDER_PORT..."
     log "  Connecting to Builder Fullnode RPC at http://localhost:$BUILDER_FULLNODE_PORT"
 
-    npx tsx scripts/builder.ts \
+    npx tsx builder/builder.ts \
         --l1-rpc http://localhost:$L1_PORT \
         --fullnode http://localhost:$BUILDER_FULLNODE_PORT \
         --rollup $ROLLUP_ADDRESS \
@@ -236,7 +236,7 @@ start_rpc_proxies() {
     log "Starting RPC Proxies..."
 
     # L1 RPC Proxy (port 8546) - intercepts L1 txs and routes through builder
-    npx tsx scripts/rpc-proxy.ts \
+    npx tsx builder/rpc-proxy.ts \
         --rpc http://localhost:$L1_PORT \
         --builder http://localhost:$BUILDER_PORT \
         --port 8546 \
@@ -244,7 +244,7 @@ start_rpc_proxies() {
 
     # L2 RPC Proxy (port 9548) - intercepts L2 txs and routes through builder
     # Note: connects to read-only fullnode for reads, builder for txs
-    npx tsx scripts/l2-rpc-proxy.ts \
+    npx tsx builder/l2-rpc-proxy.ts \
         --rpc http://localhost:$FULLNODE_RPC_PORT \
         --builder http://localhost:$BUILDER_PORT \
         --port 9548 \

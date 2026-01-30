@@ -30,7 +30,7 @@ const ADMIN_PK = process.env.ADMIN_PK;
 const L2_CHAIN_ID = 10200200;
 const L2_SYSTEM_BALANCE = ethers.parseEther("10000000000"); // 10 billion xDAI
 
-// Must match fullnode/l2-fullnode.ts DEFAULT_CONFIG.systemPrivateKey
+// Must match l2fullnode/l2-fullnode.ts DEFAULT_CONFIG.systemPrivateKey
 const SYSTEM_PRIVATE_KEY = "0x0000000000000000000000000000000000000000000000000000000000000001";
 
 const DEPLOYMENT_FILE = "gnosis-deployment.json";
@@ -51,7 +51,7 @@ function getContractArtifact(contractPath: string, contractName: string): { abi:
 }
 
 async function spawnAnvil(port: number): Promise<{ process: ChildProcess; provider: JsonRpcProvider }> {
-  // Must match fullnode/l2-fullnode.ts initializeL2() Anvil flags
+  // Must match l2fullnode/l2-fullnode.ts initializeL2() Anvil flags
   const anvilProcess = spawn("anvil", [
     "--port", port.toString(),
     "--chain-id", L2_CHAIN_ID.toString(),

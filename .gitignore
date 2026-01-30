@@ -19,5 +19,13 @@ gnosis-deployment.json
 # Logs
 logs/
 
+# Runtime state
+snapshots/
+state/
+broadcast/
+
 # Node
 node_modules/
+
+# OS
+.DS_Store

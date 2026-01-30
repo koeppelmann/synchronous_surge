@@ -61,7 +61,7 @@ The fullnode runs an internal Anvil instance and replays all L1 events to recons
 ```bash
 mkdir -p logs
 
-npx tsx fullnode/l2-fullnode.ts \
+npx tsx l2fullnode/l2-fullnode.ts \
     --l1-rpc https://rpc.gnosischain.com \
     --rollup 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
     --l2-port 9546 \
@@ -217,7 +217,7 @@ The default `https://rpc.gnosischain.com` may be rate-limited. For better perfor
 Pass your preferred RPC URL with `--l1-rpc`:
 
 ```bash
-npx tsx fullnode/l2-fullnode.ts \
+npx tsx l2fullnode/l2-fullnode.ts \
     --l1-rpc https://rpc.ankr.com/gnosis \
     --rollup 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
     --l2-port 9546 \
