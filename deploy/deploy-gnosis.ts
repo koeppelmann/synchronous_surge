@@ -5,8 +5,8 @@
  * for use by startGnosis.sh.
  *
  * Usage:
- *   ADMIN_PK=0x... npx tsx scripts/deploy-gnosis.ts           # dry run
- *   ADMIN_PK=0x... npx tsx scripts/deploy-gnosis.ts --deploy   # actually deploy
+ *   ADMIN_PK=0x... npx tsx deploy/deploy-gnosis.ts           # dry run
+ *   ADMIN_PK=0x... npx tsx deploy/deploy-gnosis.ts --deploy   # actually deploy
  *
  * Environment:
  *   ADMIN_PK   - Required. Private key for deployer/admin/owner.
@@ -169,7 +169,7 @@ async function main() {
 
   if (!ADMIN_PK) {
     console.error("Error: ADMIN_PK environment variable is required");
-    console.error("Usage: ADMIN_PK=0x... npx tsx scripts/deploy-gnosis.ts [--deploy]");
+    console.error("Usage: ADMIN_PK=0x... npx tsx deploy/deploy-gnosis.ts [--deploy]");
     process.exit(1);
   }
 

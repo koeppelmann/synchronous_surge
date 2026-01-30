@@ -209,8 +209,8 @@ For L2 transactions with outgoing L1 calls, the builder:
 | `builder/builder.ts` | Builder HTTP server |
 | `builder/rpc-proxy.ts` | L1 RPC proxy |
 | `builder/l2-rpc-proxy.ts` | L2 RPC proxy |
-| `scripts/deploy-gnosis.ts` | Deploy contracts to Gnosis mainnet |
-| `scripts/test-registry-queue.ts` | End-to-end test for L2CallRegistry queue fix |
+| `deploy/deploy-gnosis.ts` | Deploy contracts to Gnosis mainnet |
+| `deploy/test-registry-queue.ts` | End-to-end test for L2CallRegistry queue fix |
 
 ## Usage
 
@@ -227,7 +227,7 @@ forge build
 forge test
 
 # End-to-end registry queue test (starts local L1 + fullnode + builder)
-npx tsx scripts/test-registry-queue.ts
+npx tsx deploy/test-registry-queue.ts
 ```
 
 ### Run Full Stack
@@ -270,7 +270,7 @@ npx tsx builder/l2-rpc-proxy.ts --rpc http://localhost:9547 --builder http://loc
 ### Deploy to Gnosis
 
 ```bash
-ADMIN_PK=0x... npx tsx scripts/deploy-gnosis.ts --deploy
+ADMIN_PK=0x... npx tsx deploy/deploy-gnosis.ts --deploy
 ```
 
 This deploys `NativeRollupCore` and `AdminProofVerifier` to Gnosis Chain and writes `gnosis-deployment.json`.

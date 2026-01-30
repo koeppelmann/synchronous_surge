@@ -14,7 +14,7 @@
  *   TEST 2: Same L2→L1 call twice within one transaction gets correct sequential values
  *
  * Usage:
- *   npx tsx scripts/test-registry-queue.ts
+ *   npx tsx deploy/test-registry-queue.ts
  */
 
 import {

@@ -92,7 +92,7 @@ contract SyncDemoTest is Test {
      */
     function test_SetValueFlow_Conceptual() public {
         // This test demonstrates the CONTRACT LOGIC, not the full L1↔L2 flow
-        // For full flow testing, see scripts/test-sync-demo.ts
+        // For full flow testing, see deploy/test-sync-demo.ts
 
         // In a real scenario:
         // - Builder pre-registers response for value() at state Hash0 → returns 42
