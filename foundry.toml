@@ -3,4 +3,9 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
+# Pin solc version to ensure deterministic bytecode for genesis state
+# The L2 fullnode deploys system contracts at genesis, and the bytecode
+# must match exactly to produce the correct genesis state root.
+solc_version = "0.8.27"
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

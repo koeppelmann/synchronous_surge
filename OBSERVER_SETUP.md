@@ -13,19 +13,23 @@ Run a read-only L2 fullnode and dashboard to observe the Surge synchronous rollu
 
 - **Node.js** v20+ and npm
 - **Foundry** (`forge`, `cast`, `anvil`) — https://book.getfoundry.sh/getting-started/installation
+  - **Important:** Use Foundry with **solc 0.8.27** to ensure bytecode matches the deployed contracts
 - **Python 3** (for the dashboard HTTP server)
 - **Git**
 
-## Gnosis Deployment (January 2026)
+## Gnosis Deployment (February 2026)
 
 | Contract | Address | Explorer |
 |----------|---------|----------|
-| NativeRollupCore | `0x7c7aBBd57007E86323F28744808C51385e8010E4` | [Gnosisscan](https://gnosisscan.io/address/0x7c7aBBd57007E86323F28744808C51385e8010E4) |
-| AdminProofVerifier | `0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50` | [Gnosisscan](https://gnosisscan.io/address/0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50) |
+| NativeRollupCore | `0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C` | [Gnosisscan](https://gnosisscan.io/address/0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C) |
+| AdminProofVerifier | `0xfA817b7BF6DE448818B52709A3939Ae7046B0223` | [Gnosisscan](https://gnosisscan.io/address/0xfA817b7BF6DE448818B52709A3939Ae7046B0223) |
+| TokenBridgeVault (L1) | `0x69c02E7dBD6388d006Da932DF90F3215F54A4368` | [Gnosisscan](https://gnosisscan.io/address/0x69c02E7dBD6388d006Da932DF90F3215F54A4368) |
+| TokenBridgeL2 | `0xFf03cC4d43ea9d033f7A4c9FB87057e9fbC143Ea` | L2 Contract |
 
-- **Deployment Block:** `44428519`
+- **Deployment Block:** `44613529`
 - **L2 Chain ID:** `10200200`
-- **Genesis State Root:** `0x473cf0cc2c7fd6e37abf75db24443096e184b9790b87d7515114729cffe2a964`
+- **Genesis State Root:** `0x30909382f429ea0dbe44c276c1cd2b7bd1d23a21ed301a9a61833c3e814f1bb3`
+- **Compiler Version:** solc 0.8.27
 
 ## Setup Steps
 
@@ -40,11 +44,27 @@ cd synchronous_surge
 
 The fullnode needs compiled contract artifacts to deploy L2 system contracts (L2CallRegistry, L1SenderProxyL2Factory) on its internal L2 EVM.
 
+**Important:** The bytecode must match exactly what was used during the original deployment. This requires **solc 0.8.27**.
+
 ```bash
+# Check your solc version
+forge config --json | jq '.solc_version'
+
+# If needed, pin to the correct version in foundry.toml:
+# echo 'solc_version = "0.8.27"' >> foundry.toml
+
+# Build the contracts
 forge build
 ```
 
 This creates `out/L1SenderProxyL2.sol/` with the required JSON artifacts.
+
+**Verification:** After building, the genesis state root computed by the fullnode should match:
+```
+0x30909382f429ea0dbe44c276c1cd2b7bd1d23a21ed301a9a61833c3e814f1bb3
+```
+
+If you get a different genesis state root, your solc version may be different. Check the troubleshooting section.
 
 ### 3. Install Node Dependencies
 
@@ -61,12 +81,16 @@ The fullnode runs an internal Anvil instance and replays all L1 events to recons
 ```bash
 mkdir -p logs
 
+cd l2fullnode
+npm install
+cd ..
+
 npx tsx l2fullnode/l2-fullnode.ts \
     --l1-rpc https://rpc.gnosischain.com \
-    --rollup 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
+    --rollup 0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C \
     --l2-port 9546 \
     --rpc-port 9547 \
-    --l1-start-block 44428519 \
+    --l1-start-block 44613529 \
     > logs/fullnode.log 2>&1 &
 
 echo "Fullnode starting... check logs/fullnode.log"
@@ -100,7 +124,7 @@ Compare your fullnode's state against the L1 contract:
 
 ```bash
 # L1 contract's view of L2 state
-cast call 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
+cast call 0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C \
     "l2BlockHash()" \
     --rpc-url https://rpc.gnosischain.com
 
@@ -127,7 +151,7 @@ Open **http://localhost:8180** in your browser.
 ### 7. Configure the Dashboard
 
 The dashboard auto-detects Gnosis mode when served on port `8180`. It will:
-- Set the rollup address to `0x7c7aBBd57007E86323F28744808C51385e8010E4`
+- Set the rollup address to `0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C`
 - Show Gnosisscan links for all L1 addresses and transactions
 - Display values in xDAI instead of ETH
 
@@ -219,10 +243,10 @@ Pass your preferred RPC URL with `--l1-rpc`:
 ```bash
 npx tsx l2fullnode/l2-fullnode.ts \
     --l1-rpc https://rpc.ankr.com/gnosis \
-    --rollup 0x7c7aBBd57007E86323F28744808C51385e8010E4 \
+    --rollup 0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C \
     --l2-port 9546 \
     --rpc-port 9547 \
-    --l1-start-block 44428519
+    --l1-start-block 44613529
 ```
 
 ## Troubleshooting
@@ -232,6 +256,31 @@ Run `forge build` in the repository root. The fullnode needs compiled Solidity a
 
 ### State root mismatch after sync
 The fullnode may still be replaying historical events. Wait until you see `Synced!` in the log, then compare again.
+
+### Genesis state root doesn't match `0x30909382f429ea0d...`
+
+This usually means your Solidity compiler version doesn't match. The deployed contracts were compiled with **solc 0.8.27**.
+
+**Fix:**
+```bash
+# Pin the solc version in foundry.toml
+echo 'solc_version = "0.8.27"' >> foundry.toml
+
+# Clean and rebuild
+forge clean
+forge build
+
+# Restart the fullnode
+kill $(lsof -ti:9546) $(lsof -ti:9547) 2>/dev/null
+npx tsx l2fullnode/l2-fullnode.ts \
+    --l1-rpc https://rpc.gnosischain.com \
+    --rollup 0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C \
+    --l2-port 9546 \
+    --rpc-port 9547 \
+    --l1-start-block 44613529
+```
+
+The genesis state root is computed by deploying L2CallRegistry and L1SenderProxyL2Factory on a fresh Anvil instance. Different compiler versions produce different bytecode, which results in different contract addresses and state roots.
 
 ### Dashboard shows "—" for L2 values
 Check that the fullnode is running on port `9547`. Open browser console (F12) for error details.
