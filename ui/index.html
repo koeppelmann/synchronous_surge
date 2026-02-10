@@ -671,7 +671,7 @@
       <div class="row" style="margin-top:8px;">
         <div class="form-group">
           <label>Rollup Contract Address</label>
-          <input type="text" id="rollupAddress" value="0x7c7aBBd57007E86323F28744808C51385e8010E4" />
+          <input type="text" id="rollupAddress" value="0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C" />
         </div>
       </div>
     </div>
@@ -817,6 +817,12 @@
       '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC': 'Prover (Anvil #2)',
       '0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1': 'Admin/Owner',
       '0x508078D6D7b757e2e696d5E5AF6e8BDa09649bc2': 'Prover (Gnosis)',
+      '0x69c02E7dBD6388d006Da932DF90F3215F54A4368': 'TokenBridgeVault (L1)',
+      '0x007Cf8A73fccD751f27c02D6eA5917f1AAa5c7BD': 'L2SenderProxy (Bridge)',
+      '0xFf03cC4d43ea9d033f7A4c9FB87057e9fbC143Ea': 'TokenBridgeL2',
+      '0x68c6f743461e8ac7b7848388B79c46b07535ec57': 'L1SenderProxyL2 (Vault)',
+      '0x84E91d42ac8fcF49Bc777BC9ea15F82dDC60bB1a': 'Bridged USDC (bUSDC)',
+      '0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83': 'USDC.e (Gnosis)',
     };
 
     // Dynamic address list built from state history events
@@ -1024,7 +1030,7 @@
         document.getElementById('l1Rpc').value = 'http://localhost:8646';
         document.getElementById('l1ProxyRpc').value = 'http://localhost:8646';
         document.getElementById('l2ProxyRpc').value = 'http://localhost:9648';
-        document.getElementById('rollupAddress').value = '0x7c7aBBd57007E86323F28744808C51385e8010E4';
+        document.getElementById('rollupAddress').value = '0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C';
         document.getElementById('valueLabel').textContent = 'Value (xDAI)';
       });
     }
@@ -1059,10 +1065,20 @@
       const code = `<code class="copyable" title="${txHash}" onclick="copyToClipboard(this)">${short}</code>`;
       return IS_GNOSIS ? gnosisTxLink(txHash, code) : code;
     }
+    // Resolve a known label for an address, or return truncated hex
+    function addrLabel(addr) {
+      try {
+        const checksummed = ethers.getAddress(addr);
+        return KNOWN_ADDRESS_LABELS[checksummed] || (addr.slice(0, 8) + '...' + addr.slice(-4));
+      } catch {
+        return addr.slice(0, 8) + '...' + addr.slice(-4);
+      }
+    }
+
     // Render L1 address with optional Gnosisscan link
     function l1AddrHtml(addr, display) {
       if (!addr) return 'N/A';
-      display = display || (addr.slice(0, 8) + '...' + addr.slice(-4));
+      display = display || addrLabel(addr);
       const code = `<code class="copyable" title="${addr}" onclick="copyToClipboard(this)">${display}</code>`;
       return IS_GNOSIS ? gnosisAddressLink(addr, code) : code;
     }
@@ -1813,8 +1829,8 @@
 
         // L2BlockProcessed event (L2 transaction)
         if (block.eventType === 'L2BlockProcessed') {
-          const shortFrom = block.txFrom ? block.txFrom.slice(0, 8) + '...' + block.txFrom.slice(-4) : 'N/A';
-          const shortTo = block.txTo ? block.txTo.slice(0, 8) + '...' + block.txTo.slice(-4) : '(deploy)';
+          const shortFrom = block.txFrom ? addrLabel(block.txFrom) : 'N/A';
+          const shortTo = block.txTo ? addrLabel(block.txTo) : '(deploy)';
           const calldataHtml = formatCalldata(block.txData, block.txValue);
 
           return `
@@ -1852,8 +1868,8 @@
 
         // IncomingCallHandled event (L1→L2 call)
         if (block.eventType === 'IncomingCallHandled') {
-          const shortL2Addr = block.l2Address ? block.l2Address.slice(0, 8) + '...' + block.l2Address.slice(-4) : 'N/A';
-          const shortL1Caller = block.l1Caller ? block.l1Caller.slice(0, 8) + '...' + block.l1Caller.slice(-4) : 'N/A';
+          const shortL2Addr = block.l2Address ? addrLabel(block.l2Address) : 'N/A';
+          const shortL1Caller = block.l1Caller ? addrLabel(block.l1Caller) : 'N/A';
           const calldataHtml = formatCalldata(block.txData, block.txValue);
 
           return `

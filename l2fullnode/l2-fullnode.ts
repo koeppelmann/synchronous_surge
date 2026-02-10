@@ -66,7 +66,7 @@ const DEFAULT_CONFIG: L2FullnodeConfig = {
   l2Port: parseInt(process.env.L2_PORT || "9546"),
   rpcPort: parseInt(process.env.RPC_PORT || "9547"),
   l2ChainId: parseInt(process.env.L2_CHAIN_ID || "10200200"),
-  // System address: 0x1000000000000000000000000000000000000001
+  // System address: 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf (derived from private key 0x01)
   // This is the "sequencer" that executes all L2 operations
   systemPrivateKey: process.env.SYSTEM_PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000001",
   l1StartBlock: parseInt(process.env.L1_START_BLOCK || "0"),
@@ -116,6 +116,54 @@ const ROLLUP_ABI = [
 function log(component: string, message: string) {
   const timestamp = new Date().toISOString().split("T")[1].split(".")[0];
   console.log(`[${timestamp}] [${component}] ${message}`);
+}
+
+// ============ Deterministic Mining ============
+
+/**
+ * Mine a block with a deterministic timestamp derived from L1 block.
+ * This ensures that replaying the same L1 events produces identical L2 state.
+ *
+ * @param provider The L2 provider
+ * @param l1BlockNumber The L1 block number this L2 block corresponds to
+ * @param l1Provider The L1 provider to fetch block timestamp
+ */
+async function mineWithL1Timestamp(
+  provider: JsonRpcProvider,
+  l1BlockNumber: number,
+  l1Provider: JsonRpcProvider
+): Promise<void> {
+  // Get the L1 block timestamp
+  const l1Block = await l1Provider.getBlock(l1BlockNumber);
+  if (!l1Block) {
+    throw new Error(`L1 block ${l1BlockNumber} not found`);
+  }
+
+  // Get current L2 block to check its timestamp
+  const currentL2Block = await provider.send("eth_getBlockByNumber", ["latest", false]);
+  const currentTimestamp = parseInt(currentL2Block.timestamp, 16);
+  const targetTimestamp = l1Block.timestamp;
+
+  // Anvil doesn't allow going backwards in time.
+  // If the L1 timestamp is older than current L2 timestamp, we need to use
+  // the current timestamp + 1 to ensure blocks are monotonically increasing.
+  // This is a limitation of using Anvil - in a production implementation with
+  // a custom EVM, we would want true deterministic timestamps.
+  let finalTimestamp: number;
+  if (targetTimestamp <= currentTimestamp) {
+    finalTimestamp = currentTimestamp + 1;
+    log("Fullnode", `  WARNING: L1 timestamp ${targetTimestamp} <= current ${currentTimestamp}, using ${finalTimestamp}`);
+  } else {
+    finalTimestamp = targetTimestamp;
+  }
+
+  // Set the next block timestamp
+  await provider.send("evm_setNextBlockTimestamp", [finalTimestamp]);
+
+  // Mine the block
+  await provider.send("evm_mine", []);
+
+  log("Fullnode", `  Mined L2 block with timestamp ${finalTimestamp} (L1 #${l1BlockNumber} had ${targetTimestamp})`);
 }
 
 // ============ L2 Fullnode Implementation ============
@@ -196,6 +244,12 @@ export class L2Fullnode implements IFullnodeRpc {
 
     log("Fullnode", `Starting L2 EVM on port ${this.config.l2Port}...`);
 
+    // Fetch L1 deployment block timestamp BEFORE starting Anvil
+    // This ensures the genesis block has the correct deterministic timestamp
+    const l1DeploymentBlock = await this.l1Provider.getBlock(this.config.l1StartBlock || "latest");
+    const genesisTimestamp = l1DeploymentBlock ? l1DeploymentBlock.timestamp : Math.floor(Date.now() / 1000);
+    log("Fullnode", `  Genesis timestamp: ${genesisTimestamp} (from L1 #${l1DeploymentBlock?.number || 'latest'})`);
+
     this.anvilProcess = spawn(
       "anvil",
       [
@@ -205,6 +259,7 @@ export class L2Fullnode implements IFullnodeRpc {
         "--gas-price", "0",
         "--base-fee", "0",
         "--no-mining",  // Manual mining: 1 block per L1 event
+        "--timestamp", genesisTimestamp.toString(),  // Start with L1 deployment block timestamp
         "--silent",
       ],
       { stdio: ["ignore", "pipe", "pipe"] }
@@ -244,6 +299,10 @@ export class L2Fullnode implements IFullnodeRpc {
       "0x" + SYSTEM_BALANCE.toString(16),
     ]);
 
+    // Use impersonation instead of private key signing for deterministic state roots
+    // This matches how the deploy script computes the genesis state root
+    await this.l2Provider.send("anvil_impersonateAccount", [systemAddress]);
+
     this.systemWallet = new Wallet(this.config.systemPrivateKey, this.l2Provider);
 
     log("Fullnode", `System address: ${this.systemWallet.address}`);
@@ -257,45 +316,52 @@ export class L2Fullnode implements IFullnodeRpc {
 
     // For POC, deploy from compiled Foundry artifacts
     // In production, these would be pre-deployed at genesis with known addresses
+    // NOTE: Genesis timestamp is already set when starting Anvil (see startL2Evm)
 
     // Get current nonce
-    let nonce = await this.systemWallet.getNonce("pending");
-    log("Fullnode", `  System nonce: ${nonce}`);
+    const systemAddress = this.systemWallet.address;
+    const nonce = await this.l2Provider.send("eth_getTransactionCount", [systemAddress, "latest"]);
+    const nonceNum = parseInt(nonce, 16);
+    log("Fullnode", `  System nonce: ${nonceNum}`);
 
     // Compute deterministic addresses (CREATE: keccak(rlp(sender, nonce)))
-    const registryAddress = ethers.getCreateAddress({ from: this.systemWallet.address, nonce: nonce });
-    const factoryAddress = ethers.getCreateAddress({ from: this.systemWallet.address, nonce: nonce + 1 });
+    const registryAddress = ethers.getCreateAddress({ from: systemAddress, nonce: nonceNum });
+    const factoryAddress = ethers.getCreateAddress({ from: systemAddress, nonce: nonceNum + 1 });
 
-    // Send both deploy txs to mempool (no automine — they stay pending)
+    // Load artifacts
     const registryArtifact = this.loadArtifact("L2CallRegistry");
-    const registryFactory = new ContractFactory(
-      registryArtifact.abi,
-      registryArtifact.bytecode,
-      this.systemWallet
-    );
-    const registryTx = await registryFactory.deploy(
-      this.systemWallet.address,  // systemAddress
-      { nonce: nonce++ }
-    );
-
     const factoryArtifact = this.loadArtifact("L1SenderProxyL2Factory");
-    const factoryFactory = new ContractFactory(
-      factoryArtifact.abi,
-      factoryArtifact.bytecode,
-      this.systemWallet
-    );
-    const factoryTx = await factoryFactory.deploy(
-      this.systemWallet.address,      // systemAddress
-      registryAddress,                 // callRegistry (pre-computed address)
-      { nonce: nonce++ }
-    );
+
+    // Encode constructor args
+    const registryArgs = ethers.AbiCoder.defaultAbiCoder().encode(["address"], [systemAddress]).slice(2);
+    const factoryArgs = ethers.AbiCoder.defaultAbiCoder().encode(["address", "address"], [systemAddress, registryAddress]).slice(2);
+
+    // Deploy using eth_sendTransaction (impersonated, no signatures)
+    // This produces deterministic state roots matching the deploy script
+    const registryTxHash = await this.l2Provider.send("eth_sendTransaction", [{
+      from: systemAddress,
+      data: registryArtifact.bytecode + registryArgs,
+      gas: "0x1e8480", // 2M gas
+    }]);
+    log("Fullnode", `  L2CallRegistry tx: ${registryTxHash}`);
+
+    const factoryTxHash = await this.l2Provider.send("eth_sendTransaction", [{
+      from: systemAddress,
+      data: factoryArtifact.bytecode + factoryArgs,
+      gas: "0x1e8480", // 2M gas
+    }]);
+    log("Fullnode", `  L1SenderProxyL2Factory tx: ${factoryTxHash}`);
 
     // Mine a single genesis block containing both deploys
     await this.l2Provider.send("evm_mine", []);
 
-    // Wait for both to be mined
-    await registryTx.waitForDeployment();
-    await factoryTx.waitForDeployment();
+    // Verify deployments
+    const registryCode = await this.l2Provider.getCode(registryAddress);
+    const factoryCode = await this.l2Provider.getCode(factoryAddress);
+
+    if (registryCode === "0x" || factoryCode === "0x") {
+      throw new Error("System contract deployment failed");
+    }
 
     this.l2CallRegistryAddress = registryAddress;
     this.l1SenderProxyL2FactoryAddress = factoryAddress;
@@ -582,7 +648,7 @@ export class L2Fullnode implements IFullnodeRpc {
     );
   }
 
-  async nativerollup_executeL2Transaction(rawTx: string): Promise<ExecutionResult> {
+  async nativerollup_executeL2Transaction(rawTx: string, l1BlockNumber?: number): Promise<ExecutionResult> {
     log("Fullnode", `Executing L2 transaction...`);
     log("Fullnode", `  RawTx length: ${rawTx.length}`);
 
@@ -605,9 +671,13 @@ export class L2Fullnode implements IFullnodeRpc {
       }
       log("Fullnode", `  TX Hash: ${txHash}`);
 
-      // Mine a block first to include the transaction
+      // Mine a block with deterministic timestamp from L1
       log("Fullnode", `  Mining block...`);
-      await this.l2Provider.send("evm_mine", []);
+      if (l1BlockNumber) {
+        await mineWithL1Timestamp(this.l2Provider, l1BlockNumber, this.l1Provider);
+      } else {
+        await this.l2Provider.send("evm_mine", []);
+      }
 
       log("Fullnode", `  Getting receipt...`);
       const receipt = await this.l2Provider.getTransactionReceipt(txHash);
@@ -780,6 +850,7 @@ export class L2Fullnode implements IFullnodeRpc {
    * @param rawTx The RLP-encoded signed L2 transaction
    * @param outgoingCalls Array of outgoing call details (from, target, data, etc.)
    * @param outgoingCallResults The return data for each outgoing call
+   * @param l1BlockNumber L1 block number for deterministic timestamp
    */
   async nativerollup_executeL2TransactionWithOutgoingCalls(
     rawTx: string,
@@ -788,7 +859,8 @@ export class L2Fullnode implements IFullnodeRpc {
       target: string; // L1 contract being called (via proxy)
       data: string;   // Calldata to the L1 function
     }>,
-    outgoingCallResults: string[]
+    outgoingCallResults: string[],
+    l1BlockNumber?: number
   ): Promise<ExecutionResult> {
     log("Fullnode", `Executing L2 transaction with ${outgoingCalls.length} outgoing call(s)...`);
 
@@ -812,7 +884,7 @@ export class L2Fullnode implements IFullnodeRpc {
         await this.deployL1SenderProxyL2(target, this.l2Provider, this.systemWallet, true);
       }
     }
-    // Proxy deploy txs are in the mempool — they'll be mined with registrations + L2 tx
+    // Proxy deploy txs are in the mempool — they'll be mined with everything else
 
     // Step 1: Clear any stale registry entries for these call keys, then register new values.
     // This ensures repeated calls to the same L1 function get fresh return values.
@@ -856,18 +928,11 @@ export class L2Fullnode implements IFullnodeRpc {
       log("Fullnode", `    Call key: ${callKey}`);
 
       // Send to mempool — do NOT mine yet.
-      // Use very high gasPrice to ensure Anvil orders registrations before user txs.
       await registry.registerReturnValue(callKey, result, { nonce: nonce++, gasPrice: 0 });
       log("Fullnode", `    Registration tx sent (nonce ${nonce - 1})`);
     }
 
-    // Step 2: Mine registrations (+ any proxy deploys) in their own block.
-    // This must happen before the user tx because Anvil orders by gas price,
-    // and user txs from real wallets have higher gas price than system txs (gasPrice 0).
-    log("Fullnode", `  Mining registration block...`);
-    await this.l2Provider.send("evm_mine", []);
-
-    // Step 3: Send the L2 user tx and mine it
+    // Step 2: Send the L2 user tx to mempool
     log("Fullnode", `  Sending L2 tx...`);
     let txHash: string;
     try {
@@ -884,8 +949,14 @@ export class L2Fullnode implements IFullnodeRpc {
     }
     log("Fullnode", `  TX Hash: ${txHash}`);
 
-    log("Fullnode", `  Mining L2 tx block...`);
-    await this.l2Provider.send("evm_mine", []);
+    // Step 3: Mine SINGLE block with everything (proxy deploys, registrations, user tx)
+    // Use deterministic timestamp from L1 block
+    log("Fullnode", `  Mining single block with all txs...`);
+    if (l1BlockNumber) {
+      await mineWithL1Timestamp(this.l2Provider, l1BlockNumber, this.l1Provider);
+    } else {
+      await this.l2Provider.send("evm_mine", []);
+    }
 
     // Get the receipt
     const receipt = await this.l2Provider.getTransactionReceipt(txHash);
@@ -1160,6 +1231,7 @@ export class L2Fullnode implements IFullnodeRpc {
   /**
    * Execute an L1→L2 call that contains outgoing L2→L1 calls.
    * Pre-registers outgoing call results in L2CallRegistry, then executes the L1→L2 call.
+   * All operations are batched into a SINGLE L2 block with deterministic timestamp.
    */
   async nativerollup_executeL1ToL2CallWithOutgoingCalls(
     params: L1ToL2CallParams,
@@ -1246,8 +1318,14 @@ export class L2Fullnode implements IFullnodeRpc {
     };
     const tx = await this.systemWallet.sendTransaction(txRequest);
 
-    // Step 3: Mine single block with everything
-    await this.l2Provider.send("evm_mine", []);
+    // Step 3: Mine SINGLE block with deterministic timestamp from L1
+    // All txs (proxy deploy, registry ops, call) go into this one block
+    if (params.l1BlockNumber) {
+      await mineWithL1Timestamp(this.l2Provider, params.l1BlockNumber, this.l1Provider);
+    } else {
+      // Fallback for simulation/builder calls without L1 block context
+      await this.l2Provider.send("evm_mine", []);
+    }
 
     const receipt = await tx.wait();
     const newStateRoot = await this.nativerollup_getStateRoot();
@@ -1490,7 +1568,12 @@ export class L2Fullnode implements IFullnodeRpc {
       const tx = await systemWallet.sendTransaction(txRequest);
 
       // Mine a single block containing proxy deploy (if any) + this call
-      await provider.send("evm_mine", []);
+      // Use deterministic timestamp from L1 block if available
+      if (params.l1BlockNumber && !isSimulation) {
+        await mineWithL1Timestamp(provider, params.l1BlockNumber, this.l1Provider);
+      } else {
+        await provider.send("evm_mine", []);
+      }
 
       const receipt = await tx.wait();
 
@@ -1513,7 +1596,12 @@ export class L2Fullnode implements IFullnodeRpc {
       log("Fullnode", `  Call failed: ${err.message}`);
 
       // Mine to commit any pending proxy deploys even on failure
-      await provider.send("evm_mine", []);
+      // Use deterministic timestamp from L1 block if available
+      if (params.l1BlockNumber && !isSimulation) {
+        await mineWithL1Timestamp(provider, params.l1BlockNumber, this.l1Provider);
+      } else {
+        await provider.send("evm_mine", []);
+      }
       const block = await provider.send("eth_getBlockByNumber", ["latest", false]);
       return {
         success: false,
@@ -1718,6 +1806,7 @@ export class L2Fullnode implements IFullnodeRpc {
     interface L1Event {
       type: "L2BlockProcessed" | "IncomingCallHandled";
       blockNumber: number;
+      logIndex: number;
       event: ethers.EventLog;
     }
 
@@ -1725,16 +1814,23 @@ export class L2Fullnode implements IFullnodeRpc {
       ...l2BlockEvents.map((e) => ({
         type: "L2BlockProcessed" as const,
         blockNumber: e.blockNumber,
+        logIndex: e.index,
         event: e as ethers.EventLog,
       })),
       ...incomingCallEvents.map((e) => ({
         type: "IncomingCallHandled" as const,
         blockNumber: e.blockNumber,
+        logIndex: e.index,
         event: e as ethers.EventLog,
       })),
     ];
 
-    allEvents.sort((a, b) => a.blockNumber - b.blockNumber);
+    // Sort by L1 block number, then by log index within the same block
+    allEvents.sort((a, b) =>
+      a.blockNumber !== b.blockNumber
+        ? a.blockNumber - b.blockNumber
+        : a.logIndex - b.logIndex
+    );
 
     log("Fullnode", `  Found ${allEvents.length} events to replay`);
 
@@ -1766,12 +1862,23 @@ export class L2Fullnode implements IFullnodeRpc {
             const results = evtResults || [];
             log("Fullnode", `    With ${calls.length} outgoing call(s)`);
             await this.nativerollup_executeL2TransactionWithOutgoingCalls(
-              rlpEncodedTx, calls, results
+              rlpEncodedTx, calls, results, blockNumber
             );
           } else {
-            await this.nativerollup_executeL2Transaction(rlpEncodedTx);
+            await this.nativerollup_executeL2Transaction(rlpEncodedTx, blockNumber);
           }
         }
+
+        // Verify post-state matches expected
+        const postState = await this.nativerollup_getStateRoot();
+        if (postState.toLowerCase() !== newBlockHash.toLowerCase()) {
+          log("Fullnode", `  FATAL: State divergence at L2BlockProcessed (L1 #${blockNumber})`);
+          log("Fullnode", `    Computed: ${postState}`);
+          log("Fullnode", `    Expected: ${newBlockHash}`);
+          throw new Error(`State divergence at L1 block ${blockNumber}: computed ${postState}, expected ${newBlockHash}`);
+        }
+        log("Fullnode", `    Post-state verified: ${postState.slice(0, 18)}...`);
+
       } else {
         const { l2Address, l1Caller, prevBlockHash, callData, value, outgoingCalls: evtOutgoingCalls, outgoingCallResults: evtResults, finalStateHash } = event.args;
 
@@ -1794,7 +1901,7 @@ export class L2Fullnode implements IFullnodeRpc {
           const results = evtResults || [];
           log("Fullnode", `    With ${calls.length} outgoing L2→L1 call(s)`);
           await this.nativerollup_executeL1ToL2CallWithOutgoingCalls(
-            { l1Caller, l2Target: l2Address, callData, value: value.toString(), currentStateRoot: prevBlockHash },
+            { l1Caller, l2Target: l2Address, callData, value: value.toString(), currentStateRoot: prevBlockHash, l1BlockNumber: blockNumber },
             calls,
             results
           );
@@ -1805,8 +1912,21 @@ export class L2Fullnode implements IFullnodeRpc {
             callData,
             value: value.toString(),
             currentStateRoot: prevBlockHash,
+            l1BlockNumber: blockNumber,
           });
         }
+
+        // Verify post-state matches expected
+        const postState = await this.nativerollup_getStateRoot();
+        if (postState.toLowerCase() !== finalStateHash.toLowerCase()) {
+          log("Fullnode", `  FATAL: State divergence at IncomingCallHandled (L1 #${blockNumber})`);
+          log("Fullnode", `    L1 caller: ${l1Caller}`);
+          log("Fullnode", `    L2 target: ${l2Address}`);
+          log("Fullnode", `    Computed: ${postState}`);
+          log("Fullnode", `    Expected: ${finalStateHash}`);
+          throw new Error(`State divergence at L1 block ${blockNumber}: computed ${postState}, expected ${finalStateHash}`);
+        }
+        log("Fullnode", `    Post-state verified: ${postState.slice(0, 18)}...`);
       }
     }
 
@@ -1815,9 +1935,11 @@ export class L2Fullnode implements IFullnodeRpc {
     if (finalState.toLowerCase() === l1StateHash.toLowerCase()) {
       log("Fullnode", `  Synced! State: ${finalState.slice(0, 18)}...`);
     } else {
-      log("Fullnode", `  WARNING: Not fully synced!`);
-      log("Fullnode", `    Fullnode: ${finalState.slice(0, 18)}...`);
-      log("Fullnode", `    L1:       ${l1StateHash.slice(0, 18)}...`);
+      log("Fullnode", `  FATAL: State divergence detected!`);
+      log("Fullnode", `    Fullnode computed: ${finalState}`);
+      log("Fullnode", `    L1 expected:       ${l1StateHash}`);
+      log("Fullnode", `  The fullnode will abort. Check the specification for potential determinism issues.`);
+      throw new Error(`State divergence: fullnode computed ${finalState}, L1 expected ${l1StateHash}`);
     }
   }
 
@@ -1894,6 +2016,8 @@ export class L2Fullnode implements IFullnodeRpc {
               continue;
             }
 
+            const l1Block = entry.block;  // L1 block number for deterministic timestamp
+
             if (evtOutgoingCalls && evtOutgoingCalls.length > 0) {
               const calls = evtOutgoingCalls.map((c: any) => ({
                 from: c.from,
@@ -1903,7 +2027,7 @@ export class L2Fullnode implements IFullnodeRpc {
               const results = evtResults || [];
               log("Fullnode", `  With ${calls.length} outgoing L2→L1 call(s)`);
               await this.nativerollup_executeL1ToL2CallWithOutgoingCalls(
-                { l1Caller, l2Target: l2Address, callData, value: value.toString(), currentStateRoot: currentState },
+                { l1Caller, l2Target: l2Address, callData, value: value.toString(), currentStateRoot: currentState, l1BlockNumber: l1Block },
                 calls,
                 results
               );
@@ -1914,19 +2038,21 @@ export class L2Fullnode implements IFullnodeRpc {
                 callData,
                 value: value.toString(),
                 currentStateRoot: currentState,
+                l1BlockNumber: l1Block,
               });
             }
           } else if (entry.type === 'l2block') {
             const e = entry.event;
             const args = (e as any).args;
-            const blockNumber = args.blockNumber;
+            const l2BlockNumber = args.blockNumber;
             const newBlockHash = args.newBlockHash;
             const rlpEncodedTx = args.rlpEncodedTx;
             const evtOutgoingCalls = args.outgoingCalls;
             const evtResults = args.outgoingCallResults;
+            const l1Block = entry.block;  // L1 block number for deterministic timestamp
 
             log("Fullnode", `L2BlockProcessed event:`);
-            log("Fullnode", `  Block: ${blockNumber}`);
+            log("Fullnode", `  Block: ${l2BlockNumber}`);
             log("Fullnode", `  New hash: ${newBlockHash}`);
 
             const currentState = await this.nativerollup_getStateRoot();
@@ -1946,10 +2072,10 @@ export class L2Fullnode implements IFullnodeRpc {
                 const results = evtResults || [];
                 log("Fullnode", `  With ${calls.length} outgoing call(s)`);
                 await this.nativerollup_executeL2TransactionWithOutgoingCalls(
-                  rlpEncodedTx, calls, results
+                  rlpEncodedTx, calls, results, l1Block
                 );
               } else {
-                await this.nativerollup_executeL2Transaction(rlpEncodedTx);
+                await this.nativerollup_executeL2Transaction(rlpEncodedTx, l1Block);
               }
             }
           }

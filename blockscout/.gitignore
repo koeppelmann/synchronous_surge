@@ -1,0 +1,4 @@
+blockscout-db-data/
+redis-data/
+logs/
+solc-compilers/

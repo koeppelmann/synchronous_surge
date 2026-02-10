@@ -136,6 +136,7 @@ export interface L1ToL2CallParams {
   callData: string;
   value: string;  // Hex-encoded uint256
   currentStateRoot: string;
+  l1BlockNumber?: number;  // L1 block number for deterministic timestamp derivation
 }
 
 /**

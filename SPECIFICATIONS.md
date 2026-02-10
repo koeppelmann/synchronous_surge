@@ -1,123 +1,289 @@
-# Synchronous Surge Component Specifications
+# Surge L2 State Derivation Specification
 
-## Overview
+**Version 0.2 - Draft**
 
-This document specifies the exact behavior of each component in the Synchronous Surge system. The system enables **synchronous composability** between L1 and L2 - meaning L1 contracts can call L2 contracts and vice versa within a single atomic transaction.
-
-### Key Invariant
-
-**L2 state is a pure function of L1 events.** Given the same L1 event history, any fullnode MUST derive the exact same L2 state.
-
-### State Root
-
-The `l2BlockHash` (also called "state root") is the Ethereum state root of the L2 EVM. It uniquely identifies the entire L2 state (all account balances, contract storage, code, nonces).
+This document specifies how L2 state is deterministically derived from L1 events in the Surge synchronous rollup system. It also describes the operational components (Builder, Proxy, etc.) that interact with this system.
 
 ---
 
-## 1. L2 Fullnode
+## Part I: State Derivation Specification
 
-### Purpose
-The L2 Fullnode maintains L2 state by watching L1 events and applying state transitions. It exposes an Ethereum JSON-RPC interface for querying L2 state.
+### 1. Fundamental Invariant
 
-### Initialization
+```
+L2_State_Root = f(Genesis_State, L1_Events[0..n])
+```
 
-1. Read the `l2BlockHash` from NativeRollupCore at genesis (block 0)
-2. Create a fresh EVM instance with:
-   - Chain ID: configured (e.g., 10200200)
-   - System address `0x1000000000000000000000000000000000000001` funded with 10B ETH
-   - No other pre-funded accounts
-3. The state root after this setup MUST equal the genesis `l2BlockHash` from L1
-4. If mismatch: the fullnode cannot sync and must abort
+The L2 state root is a **pure function** of:
+1. A well-defined genesis state
+2. An ordered sequence of L1 events
 
-### Event Processing
+Any compliant fullnode MUST derive the identical state root given the same inputs.
 
-The fullnode watches two event types from NativeRollupCore:
+---
 
-#### A. `L2BlockProcessed` Event
+### 2. Genesis State
+
+#### 2.1 L2 Chain Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Chain ID | 10200200 |
+| System Address | `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf` |
+| System Private Key | `0x0000000000000000000000000000000000000000000000000000000000000001` |
+
+#### 2.2 Initial Account State
+
+At genesis (before any L1 events), the L2 state contains exactly the following accounts:
+
+##### 2.2.1 System Address
+
+| Field | Value |
+|-------|-------|
+| Address | `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf` |
+| Balance | 10,000,000,000 ETH (10^28 wei) |
+| Nonce | 0 |
+| Code | Empty |
+| Storage | Empty |
+
+##### 2.2.2 System Contract Deployment
+
+The system address deploys exactly 2 contracts at genesis, using sequential nonces:
+
+**Contract 1: L2CallRegistry (nonce 0)**
+```
+Address = keccak256(RLP([system_address, 0]))[12:32]
+       = 0xF2E246BB76DF876Cef8b38ae84130F4F55De395b
+```
+
+Constructor arguments:
+- `systemAddress`: `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf`
+
+**Contract 2: L1SenderProxyL2Factory (nonce 1)**
+```
+Address = keccak256(RLP([system_address, 1]))[12:32]
+       = 0x2946259E0334f33A064106302415aD3391BeD384
+```
+
+Constructor arguments:
+- `systemAddress`: `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf`
+- `callRegistry`: `0xF2E246BB76DF876Cef8b38ae84130F4F55De395b`
+
+#### 2.3 Genesis State Root
+
+After deploying the two system contracts:
+- System address nonce = 2
+- System address balance = 10^28 wei (unchanged, gas price = 0)
+- Two contracts deployed with their respective code and empty storage
+
+The genesis state root MUST equal the `genesisStateRoot` stored in the L1 NativeRollupCore contract at deployment.
+
+---
+
+### 3. L1 Events
+
+The NativeRollupCore contract emits the following events that affect L2 state:
+
+#### 3.1 State-Changing Events
+
+These events MUST be processed to derive L2 state:
+
+##### 3.1.1 L2BlockProcessed
 
 ```solidity
 event L2BlockProcessed(
-    uint256 indexed blockNumber,
+    uint256 indexed l2BlockNumber,
     bytes32 indexed prevBlockHash,
     bytes32 indexed newBlockHash,
-    bytes rlpEncodedTx,              // The RLP-encoded signed L2 transaction
-    OutgoingCall[] outgoingCalls,    // L2→L1 calls made during execution
-    bytes[] outgoingCallResults      // Results of those L1 calls
+    bytes rlpEncodedTx,
+    OutgoingCall[] outgoingCalls,
+    bytes[] outgoingCallResults
 );
+
+struct OutgoingCall {
+    address from;
+    address target;
+    uint256 value;
+    uint256 gas;
+    bytes data;
+    bytes32 postCallStateHash;
+}
 ```
 
-**Processing Steps:**
-
-1. Verify `prevBlockHash` matches current local state root
-2. Extract `rlpEncodedTx` directly from the event data (no need to look up L1 transaction calldata)
-3. Parse `rlpEncodedTx` as a signed L2 transaction
-4. Execute the transaction on L2:
-   - Sender: recovered from signature
-   - Verify nonce matches sender's current nonce
-   - Apply gas, value, and data
-5. Verify local state root now equals `newBlockHash`
-6. If `outgoingCalls.length > 0`, process the outgoing calls (L2→L1 calls)
-
-**Note:** The event contains ALL data needed for the fullnode to reconstruct L2 state. The fullnode does NOT need to look up L1 transaction calldata.
-
-#### B. `IncomingCallHandled` Event
+##### 3.1.2 IncomingCallHandled
 
 ```solidity
 event IncomingCallHandled(
-    address indexed l2Address,           // L2 contract being called
-    address indexed l1Caller,            // L1 contract that initiated the call
-    bytes32 indexed prevBlockHash,       // L2 state hash before this call
-    bytes callData,                      // The calldata sent to L2 contract
-    uint256 value,                       // ETH value sent
-    OutgoingCall[] outgoingCalls,        // L2→L1 calls made during execution
-    bytes[] outgoingCallResults,         // Results returned by L1 calls
-    bytes32 finalStateHash               // Final L2 state after all calls
+    address indexed l2Target,
+    address indexed l1Caller,
+    bytes32 indexed prevBlockHash,
+    bytes callData,
+    uint256 value,
+    OutgoingCall[] outgoingCalls,
+    bytes[] outgoingCallResults,
+    bytes32 finalStateHash
 );
 ```
 
+#### 3.2 Informational Events
+
+These events do NOT directly change L2 state but provide useful information:
+
+- `L2SenderProxyDeployed(address indexed l1Address, address indexed proxyAddress)`
+- `IncomingCallRegistered(address indexed l2Address, bytes32 indexed stateHash, bytes32 indexed callDataHash, bytes32 responseKey)`
+- `OutgoingCallExecuted(uint256 indexed blockNumber, uint256 indexed callIndex, address indexed from, address target, bool success)`
+- `L2StateUpdated(uint256 indexed blockNumber, bytes32 indexed newStateHash, uint256 callIndex)`
+
+---
+
+### 4. Event Processing Rules
+
+#### 4.1 Event Ordering
+
+Events MUST be processed in strict order:
+1. By L1 block number (ascending)
+2. Within the same L1 block, by log index (ascending)
+
+Example timeline:
+```
+L1 Block 5:  IncomingCallRegistered (log 0)
+L1 Block 5:  ProxyDeployed (log 1)
+L1 Block 6:  IncomingCallHandled (log 0)    <- Apply state change
+L1 Block 7:  L2BlockProcessed (log 0)        <- Apply L2 tx
+```
+
+The fullnode processes these in order: 5.0, 5.1, 6.0, 7.0
+
+#### 4.2 State Matching Requirement
+
+For both `L2BlockProcessed` and `IncomingCallHandled`:
+
+```
+IF event.prevBlockHash != current_l2_state_root:
+    SKIP event (not applicable to current state)
+```
+
+This ensures only events that apply to the current state are processed.
+
+#### 4.3 L2BlockProcessed Processing
+
+**Input:** Current L2 state with root `S_prev`
+
+**Precondition:** `event.prevBlockHash == S_prev`
+
 **Processing Steps:**
 
-1. Verify `prevBlockHash` matches current local state root
-2. Extract `callData` directly from the event data (no need to trace L1 transaction)
-3. Compute `l1ProxyOnL2 = computeL1SenderProxyL2Address(l1Caller)`
-4. If `value > 0`: credit `value` ETH to `l2Address`
-5. If `callData` is not empty:
-   - Execute call on L2 with:
-     - `from`: `l1ProxyOnL2` (the L1 caller's proxy on L2)
-     - `to`: `l2Address`
-     - `data`: `callData`
-     - `value`: `value`
-6. If `outgoingCalls.length > 0`, process the outgoing calls (L2→L1 calls)
-7. Verify local state root now equals `finalStateHash`
+1. **Decode Transaction**
+   ```
+   tx = RLP.decode(event.rlpEncodedTx)
+   sender = ecrecover(tx.signature, tx.hash)
+   ```
 
-**Note:** The event contains ALL data needed for the fullnode to reconstruct L2 state. The fullnode does NOT need to look up L1 transaction calldata or query L1 storage.
+2. **Pre-register Outgoing Call Results** (if any)
+   ```
+   FOR each (call, result) in zip(event.outgoingCalls, event.outgoingCallResults):
+       callKey = keccak256(call.target, call.from, call.data)
+       L2CallRegistry.registerReturnValue(callKey, result)
+   ```
 
-### State Root Computation
+   This step uses the system address to call L2CallRegistry. Each registration increments the system nonce.
 
-The fullnode MUST use the same state root computation as the builder:
+3. **Execute L2 Transaction**
+   ```
+   receipt = EVM.execute(tx)
+   S_post_tx = EVM.getStateRoot()
+   ```
+
+4. **Verify Final State**
+   ```
+   REQUIRE S_post_tx == event.newBlockHash
+   ```
+
+5. **Update State**
+   ```
+   current_l2_state_root = event.newBlockHash
+   l2_block_number = event.l2BlockNumber
+   ```
+
+#### 4.4 IncomingCallHandled Processing
+
+**Input:** Current L2 state with root `S_prev`
+
+**Precondition:** `event.prevBlockHash == S_prev`
+
+**Processing Steps:**
+
+1. **Determine L1 Sender Proxy Address**
+   ```
+   proxyAddress = L1SenderProxyL2Factory.computeProxyAddress(event.l1Caller)
+   ```
+
+2. **Deploy Proxy if Needed**
+   ```
+   IF code_at(proxyAddress) == empty:
+       L1SenderProxyL2Factory.deployProxy(event.l1Caller)
+       // This increments system nonce
+   ```
+
+3. **Pre-register Outgoing Call Results** (if any)
+   ```
+   FOR each (call, result) in zip(event.outgoingCalls, event.outgoingCallResults):
+       callKey = keccak256(call.target, call.from, call.data)
+       L2CallRegistry.registerReturnValue(callKey, result)
+   ```
+
+4. **Execute L1→L2 Call**
+
+   The system address calls the proxy with packed calldata:
+   ```
+   packedCalldata = abi.encodePacked(event.l2Target, event.callData)
+
+   system_address.call{value: event.value}(
+       to: proxyAddress,
+       data: packedCalldata
+   )
+   ```
+
+   The proxy then:
+   - Extracts target address from first 20 bytes
+   - Forwards call to target with remaining calldata
+   - Forwards the value
+
+5. **Verify Final State**
+   ```
+   S_final = EVM.getStateRoot()
+   REQUIRE S_final == event.finalStateHash
+   ```
+
+6. **Update State**
+   ```
+   current_l2_state_root = event.finalStateHash
+   ```
+
+---
+
+### 5. L1 Sender Proxy System
+
+#### 5.1 Proxy Address Computation
+
+Each L1 address has a unique, deterministic proxy address on L2:
 
 ```
-stateRoot = keccak256(RLP(accountTrie))
-```
+SALT_PREFIX = keccak256("NativeRollup.L1SenderProxyL2.v1")
 
-Where `accountTrie` is the Merkle Patricia Trie of all accounts, and each account contains:
-- nonce
-- balance
-- storageRoot (hash of storage trie)
-- codeHash
+salt = keccak256(abi.encodePacked(SALT_PREFIX, l1Address))
 
-### L1 Caller Proxy Address
+initCodeHash = keccak256(
+    L1SenderProxyL2.creationCode +
+    abi.encode(systemAddress, l1Address, callRegistryAddress)
+)
 
-When an L1 contract calls an L2 contract, the `msg.sender` on L2 is NOT the L1 contract address. Instead, it's a deterministic proxy address computed as:
-
-```typescript
-function computeL1SenderProxyL2Address(l1Address: string): string {
-  const hash = keccak256(solidityPacked(
-    ["string", "address"],
-    ["L1SenderProxyL2.v1", l1Address]
-  ));
-  return "0x" + hash.slice(-40);
-}
+proxyAddress = address(uint160(uint256(keccak256(abi.encodePacked(
+    bytes1(0xff),
+    factoryAddress,
+    salt,
+    initCodeHash
+)))))
 ```
 
 This ensures:
@@ -125,7 +291,216 @@ This ensures:
 - L2 contracts can identify which L1 contract called them
 - The address is the same across all fullnodes
 
-### API
+#### 5.2 Proxy Behavior
+
+**When called by System Address (L1→L2 direction):**
+```
+function fallback() {
+    require(msg.data.length >= 20);
+    address target = address(bytes20(msg.data[0:20]));
+    bytes memory data = msg.data[20:];
+
+    (bool success, bytes memory result) = target.call{value: msg.value}(data);
+    require(success);
+    return result;
+}
+```
+
+**When called by Other (L2→L1 direction):**
+```
+function fallback() {
+    bytes32 callKey = keccak256(abi.encodePacked(l1Address, msg.sender, msg.data));
+    (bool registered, bytes memory result) = callRegistry.getReturnValue(callKey);
+    require(registered);
+    return result;
+}
+```
+
+---
+
+### 6. L2 Call Registry
+
+#### 6.1 Storage Structure
+
+```solidity
+mapping(bytes32 => mapping(uint256 => bytes)) returnValues;  // callKey => index => data
+mapping(bytes32 => uint256) callCount;                        // callKey => registered count
+mapping(bytes32 => uint256) consumed;                         // callKey => consumed count
+```
+
+#### 6.2 Operations
+
+**registerReturnValue(callKey, data):**
+```
+require(msg.sender == systemAddress);
+uint256 index = callCount[callKey];
+returnValues[callKey][index] = data;
+callCount[callKey] = index + 1;
+```
+
+**getReturnValue(callKey) returns (bool, bytes):**
+```
+uint256 index = consumed[callKey];
+if (index >= callCount[callKey]) return (false, "");
+bytes memory data = returnValues[callKey][index];
+consumed[callKey] = index + 1;  // FIFO consumption
+return (true, data);
+```
+
+**clearReturnValues(callKey):**
+```
+require(msg.sender == systemAddress);
+delete callCount[callKey];
+delete consumed[callKey];
+// Note: individual returnValues entries not deleted for gas efficiency
+```
+
+---
+
+### 7. Nonce Management
+
+#### 7.1 System Address Nonce
+
+The system address nonce increments for each transaction it sends:
+
+| Operation | Nonce Used |
+|-----------|------------|
+| Deploy L2CallRegistry | 0 |
+| Deploy L1SenderProxyL2Factory | 1 |
+| First proxy deployment | 2 |
+| First registry write | 3 |
+| ... | ... |
+
+#### 7.2 User Address Nonces
+
+User transaction nonces are validated during L2BlockProcessed:
+```
+require(tx.nonce == account[tx.from].nonce);
+account[tx.from].nonce++;
+```
+
+---
+
+### 8. Balance Management
+
+#### 8.1 ETH Credits from L1→L2
+
+When processing `IncomingCallHandled` with `value > 0`:
+
+The ETH is credited to the L2 target through the proxy call mechanism:
+1. System address sends `value` to proxy
+2. Proxy forwards `value` to target
+
+This debits system address and credits target.
+
+#### 8.2 Gas Costs
+
+On L2, gas price is 0. All transactions execute without consuming ETH for gas.
+
+---
+
+### 9. State Root Computation
+
+The L2 state root is computed as:
+
+```
+stateRoot = keccak256(RLP(accountTrie))
+```
+
+Where `accountTrie` is a Merkle Patricia Trie containing all accounts:
+
+```
+account = RLP([nonce, balance, storageRoot, codeHash])
+```
+
+This follows standard Ethereum state root computation (EIP-161).
+
+---
+
+### 10. Determinism Requirements
+
+For deterministic state derivation, the following MUST be consistent:
+
+| Parameter | Requirement |
+|-----------|-------------|
+| EVM Version | Paris (no PREVRANDAO randomness) |
+| Block Timestamp | **MUST** be derived from L1 block timestamp |
+| Block Number | Sequential from 0 |
+| Block Gas Limit | Fixed (e.g., 30M) |
+| Coinbase | System address or zero address |
+| Base Fee | 0 |
+| Gas Price | 0 for all transactions |
+
+#### 10.1 Block Timestamp Derivation
+
+**CRITICAL**: Each L2 block's timestamp MUST be derived from the L1 block that contains the corresponding L1 event:
+
+```
+L2_block.timestamp = L1_block[event.blockNumber].timestamp
+```
+
+This ensures that replaying the same L1 events at any point in time produces identical L2 state.
+
+#### 10.2 One Block Per Event
+
+Each state-changing L1 event (`L2BlockProcessed` or `IncomingCallHandled`) produces exactly ONE L2 block. All operations for that event (proxy deployment, registry operations, main call/transaction) are included in a single block.
+
+#### Sources of Non-Determinism (to avoid)
+
+- Block timestamp from system clock (ALWAYS use L1-derived timestamp)
+- Block number not matching event sequence
+- Block hash as randomness (don't use)
+- Gas pricing variations (use fixed gas price of 0)
+- Precompile behavior differences (use standard precompiles)
+- Mining multiple blocks per event (all operations go in one block)
+
+---
+
+### 11. Error Handling
+
+#### 11.1 State Mismatch
+
+If computed state root does not match event's expected state:
+```
+ABORT processing
+LOG error with details
+```
+
+The fullnode should NOT continue processing subsequent events.
+
+#### 11.2 Transaction Failure
+
+If an L2 transaction reverts:
+- The transaction's state changes are NOT applied
+- The state root should still match (revert is deterministic)
+
+#### 11.3 Missing Events
+
+If events are missing (gap in block numbers), the fullnode should:
+- Wait for missing events
+- Or report sync failure
+
+---
+
+## Part II: Component Specifications
+
+### 12. L2 Fullnode
+
+#### Purpose
+The L2 Fullnode maintains L2 state by watching L1 events and applying state transitions. It exposes an Ethereum JSON-RPC interface for querying L2 state.
+
+#### Initialization
+
+1. Read the `l2BlockHash` from NativeRollupCore at genesis (block 0)
+2. Create a fresh EVM instance with:
+   - Chain ID: 10200200
+   - System address `0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf` funded with 10B ETH
+   - No other pre-funded accounts
+3. Deploy L2CallRegistry and L1SenderProxyL2Factory
+4. The state root after this setup MUST equal the genesis `l2BlockHash` from L1
+5. If mismatch: the fullnode cannot sync and must abort
+
+#### API
 
 Standard Ethereum JSON-RPC on configured port (default: 9546):
 - `eth_call` - Query L2 state
@@ -137,12 +512,12 @@ Standard Ethereum JSON-RPC on configured port (default: 9546):
 
 ---
 
-## 2. Builder
+### 13. Builder
 
-### Purpose
+#### Purpose
 The Builder receives transactions, simulates them to compute the resulting state, and submits them to L1 with proofs.
 
-### API Endpoint
+#### API Endpoint
 
 `POST /submit`
 
@@ -158,19 +533,9 @@ interface SubmitRequest {
 }
 ```
 
-**Hint: l2Addresses**
+#### Transaction Types
 
-When submitting an L1 transaction that will call L2 contracts, provide the `l2Addresses` hint with an array of L2 contract addresses. This allows the builder to:
-
-1. Deploy L2SenderProxy for each L2 address (if not already deployed)
-2. Pre-register the incoming call responses before the L1 tx executes
-3. Ensure the L1 tx doesn't revert due to missing proxies or responses
-
-Without this hint, the builder will still try to detect L2 calls via tracing, but this may fail if the proxies aren't deployed yet.
-
-### Transaction Types
-
-#### A. L2 Transaction (sourceChain: "L2")
+##### A. L2 Transaction (sourceChain: "L2")
 
 A standard Ethereum transaction targeting L2.
 
@@ -185,20 +550,7 @@ A standard Ethereum transaction targeting L2.
 7. Sign proof covering: prevHash, callData, newStateRoot
 8. Submit to NativeRollupCore.processCallOnL2()
 
-**L1 Call:**
-```solidity
-processSingleTxOnL2(
-  prevL2BlockHash,              // Current l2BlockHash
-  rlpEncodedTx,                 // The RLP-encoded signed L2 transaction
-  preOutgoingCallsStateHash,    // State after L2 execution, before L1 calls
-  outgoingCalls,                // L2→L1 calls (empty for simple tx)
-  expectedResults,              // Expected results (empty for simple tx)
-  finalStateHash,               // Final state after all calls
-  proof                         // Admin signature
-)
-```
-
-#### B. L1 Transaction with L2 Interaction (sourceChain: "L1")
+##### B. L1 Transaction with L2 Interaction (sourceChain: "L1")
 
 An L1 transaction that may call L2 contracts via L2SenderProxy.
 
@@ -218,55 +570,7 @@ An L1 transaction that may call L2 contracts via L2SenderProxy.
    d. Sign and register the incoming call response on L1
 9. Broadcast the original L1 transaction
 
-**Important:** Proxy deployment happens BEFORE tracing. This ensures the trace can detect the proxy calls.
-
-**L1 Calls (for each L2 interaction):**
-```solidity
-// Step 0: Deploy proxies for hinted L2 addresses (before tracing)
-for (l2Address in hints.l2Addresses) {
-  if (!isProxyDeployed(l2Address)) {
-    deployProxy(l2Address)
-  }
-}
-
-// Step 1: Register the expected response (for each detected L2 call)
-registerIncomingCall(
-  l2Address,            // L2 contract being called
-  currentL2BlockHash,   // State at which this response is valid
-  callData,             // The calldata
-  {
-    preOutgoingCallsStateHash: newStateRoot,
-    outgoingCalls: [],
-    expectedResults: [],
-    returnValue: "0x",
-    finalStateHash: newStateRoot
-  },
-  proof                 // Admin signature
-)
-
-// Step 2: Broadcast user's original L1 tx
-eth_sendRawTransaction(signedTx)
-```
-
-#### C. Simple L1 Transaction (sourceChain: "L1", no L2 interaction)
-
-An L1 transaction that doesn't interact with L2.
-
-**Processing Steps:**
-
-1. Detect that transaction doesn't call any L2SenderProxy
-2. Simply broadcast to L1: `eth_sendRawTransaction(signedTx)`
-
-### Simulation Requirements
-
-The builder MUST simulate L2 effects using the **exact same execution environment** as the fullnode:
-
-1. Fork from the fullnode's current state
-2. Use identical EVM configuration (chain ID, gas settings)
-3. Execute the same operations in the same order
-4. State roots will match because inputs are identical
-
-### Proof Generation
+#### Proof Generation
 
 For POC, proofs are admin signatures. The builder signs:
 
@@ -285,12 +589,12 @@ const signature = adminWallet.signMessage(getBytes(messageHash));
 
 ---
 
-## 3. L1 Proxy (RPC Proxy)
+### 14. L1 Proxy (RPC Proxy)
 
-### Purpose
+#### Purpose
 Intercepts wallet transactions and routes them through the Builder.
 
-### Behavior
+#### Behavior
 
 All `eth_sendRawTransaction` calls are forwarded to the Builder. The proxy does NOT try to determine which transactions need L2 interaction - that's the Builder's job.
 
@@ -305,29 +609,20 @@ async function handleSendRawTransaction(signedTx: string): Promise<string> {
 }
 ```
 
-### Why Not Filter?
-
-The proxy cannot know which L1 contracts might internally call L2. An L1 contract like `L1SyncedCounter` doesn't appear special, but its `setValue()` function calls an L2 contract. The Builder traces execution to detect this.
-
-### API
+#### API
 
 Standard Ethereum JSON-RPC on configured port (default: 8546):
 - `eth_sendRawTransaction` → Forward to Builder
 - All other methods → Forward to underlying L1 RPC
 
-### Additional Endpoints
-
-- `GET /status` - Proxy status
-- `POST /register-hint` - Register L2 target hint (optional optimization)
-
 ---
 
-## 4. L2SenderProxy (L1 Contract)
+### 15. L2SenderProxy (L1 Contract)
 
-### Purpose
+#### Purpose
 Acts as `msg.sender` on L1 for calls originating from L2 contracts.
 
-### Deployment
+#### Deployment
 
 Deployed via CREATE2 by NativeRollupCore with deterministic address:
 
@@ -338,29 +633,11 @@ address proxy = CREATE2(
 );
 ```
 
-### Address Computation
-
-```solidity
-function getProxyAddress(address l2Address) public view returns (address) {
-    bytes32 bytecodeHash = keccak256(abi.encodePacked(
-        type(L2SenderProxy).creationCode,
-        abi.encode(address(this), l2Address)
-    ));
-
-    return address(uint160(uint256(keccak256(abi.encodePacked(
-        bytes1(0xff),
-        address(this),
-        keccak256(abi.encode(PROXY_SALT, l2Address)),
-        bytecodeHash
-    )))));
-}
-```
-
-### Dual Role
+#### Dual Role
 
 The L2SenderProxy serves TWO purposes:
 
-#### A. Outgoing Calls (L2→L1)
+##### A. Outgoing Calls (L2→L1)
 
 When an L2 contract calls an L1 contract, NativeRollupCore routes the call through the proxy:
 
@@ -370,9 +647,7 @@ address proxy = _getOrDeployProxy(outgoingCall.from);
 L2SenderProxy(proxy).execute(target, data);
 ```
 
-The L1 contract sees `msg.sender = proxy`, which uniquely identifies the L2 caller.
-
-#### B. Incoming Calls (L1→L2)
+##### B. Incoming Calls (L1→L2)
 
 When an L1 contract calls an L2 contract, it calls the proxy address:
 
@@ -381,126 +656,71 @@ When an L1 contract calls an L2 contract, it calls the proxy address:
 l2ContractProxy.someFunction{value: 1 ether}(args);
 ```
 
-The proxy's `fallback()` forwards to `NativeRollupCore.handleIncomingCall()`:
+The proxy's `fallback()` forwards to `NativeRollupCore.handleIncomingCall()`.
 
-```solidity
-fallback(bytes calldata) external payable returns (bytes memory) {
-    return INativeRollupCore(nativeRollup).handleIncomingCall{value: msg.value}(
-        l2Address,
-        msg.sender,  // The L1 caller
-        msg.data
-    );
-}
+---
+
+## Part III: Reference Implementation
+
+### 16. Anvil Configuration
+
+When using Anvil as L2 EVM:
+```
+anvil \
+  --chain-id 10200200 \
+  --gas-price 0 \
+  --block-base-fee-per-gas 0 \
+  --no-mining \
+  --accounts 0
 ```
 
-### Incoming Call Handling
+Key settings:
+- `--no-mining`: Manual block production
+- `--gas-price 0`: Free transactions
+- `--accounts 0`: No pre-funded accounts (we fund system address explicitly)
 
-`handleIncomingCall` looks up a pre-registered response:
+### 17. State Root Retrieval
 
-```solidity
-function handleIncomingCall(
-    address l2Address,
-    address l1Caller,
-    bytes calldata callData
-) external payable returns (bytes memory) {
-    bytes32 responseKey = keccak256(abi.encode(l2Address, l2BlockHash, keccak256(callData)));
-
-    // Revert if not pre-registered
-    if (!incomingCallRegistered[responseKey]) {
-        revert IncomingCallNotRegistered(responseKey);
-    }
-
-    IncomingCallResponse storage response = incomingCallResponses[responseKey];
-
-    // Update L2 state
-    l2BlockHash = response.finalStateHash;
-
-    // Return pre-registered value
-    return response.returnValue;
-}
+After each transaction/call:
+```javascript
+const block = await provider.send("eth_getBlockByNumber", ["latest", false]);
+const stateRoot = block.stateRoot;
 ```
 
 ---
 
-## State Root Determinism
+## Part IV: Configuration Reference
 
-### Requirements
+### L2 Fullnode
 
-For the system to work, state roots MUST be deterministic:
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--l1-rpc` | `http://localhost:8545` | L1 RPC endpoint |
+| `--rollup` | Required | NativeRollupCore address |
+| `--port` | `9546` | L2 RPC port |
+| `--chain-id` | `10200200` | L2 chain ID |
 
-1. Given genesis state G
-2. Apply operations O1, O2, O3...
-3. Result state root R must be identical on all nodes
+### Builder
 
-### Sources of Non-Determinism (to avoid)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--l1-rpc` | `http://localhost:8545` | L1 RPC endpoint |
+| `--fullnode` | `http://localhost:9546` | L2 fullnode endpoint |
+| `--rollup` | Required | NativeRollupCore address |
+| `--admin-key` | Required | Private key for signing proofs |
+| `--port` | `3200` | Builder API port |
 
-- Block timestamp (use fixed or L1-derived)
-- Block number (use L1 block number or event index)
-- Block hash as randomness (don't use)
-- Gas pricing (use fixed gas price)
-- Precompile behavior differences (use standard precompiles)
+### L1 Proxy
 
-### L2 Transaction Execution
-
-When executing an L2 transaction:
-
-```
-Input:
-  - prevStateRoot: bytes32
-  - signedTx: bytes (RLP-encoded signed transaction)
-
-Output:
-  - newStateRoot: bytes32
-  - success: bool
-  - logs: Log[]
-```
-
-The EVM execution MUST be deterministic given:
-- Previous state (identified by prevStateRoot)
-- Transaction bytes
-- Block context (timestamp, number, etc. - must be deterministic)
-
-### Incoming Call Execution
-
-When processing an L1→L2 call:
-
-```
-Input:
-  - prevStateRoot: bytes32
-  - l1Caller: address
-  - l2Target: address
-  - callData: bytes
-  - value: uint256
-
-Output:
-  - newStateRoot: bytes32
-```
-
-Execution steps:
-1. l1ProxyOnL2 = computeL1SenderProxyL2Address(l1Caller)
-2. If value > 0: l2Target.balance += value
-3. If callData != 0x: execute call from l1ProxyOnL2 to l2Target
-4. Compute new state root
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--rpc` | `http://localhost:8545` | Underlying L1 RPC |
+| `--builder` | `http://localhost:3200` | Builder API endpoint |
+| `--port` | `8546` | Proxy port |
 
 ---
 
-## Event Ordering
-
-Events MUST be processed in L1 block order, then by log index within a block.
-
-Example timeline:
-```
-L1 Block 5:  IncomingCallRegistered (log 0)
-L1 Block 5:  ProxyDeployed (log 1)
-L1 Block 6:  IncomingCallHandled (log 0)    <- Apply state change
-L1 Block 7:  L2BlockProcessed (log 0)        <- Apply L2 tx
-```
-
-The fullnode processes these in order: 5.0, 5.1, 6.0, 7.0
-
----
-
-## Error Handling
+## Part V: Error Reference
 
 ### Builder Errors
 
@@ -529,7 +749,7 @@ The fullnode processes these in order: 5.0, 5.1, 6.0, 7.0
 
 ---
 
-## Security Considerations
+## Part VI: Security Considerations
 
 ### Builder Trust
 
@@ -554,31 +774,76 @@ In production, ZK proofs would replace admin signatures.
 
 ---
 
-## Configuration
+## Appendix A: Contract ABIs
 
-### L2 Fullnode
+### A.1 L2CallRegistry
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--l1-rpc` | `http://localhost:8545` | L1 RPC endpoint |
-| `--rollup` | Required | NativeRollupCore address |
-| `--port` | `9546` | L2 RPC port |
-| `--chain-id` | `10200200` | L2 chain ID |
+```solidity
+interface IL2CallRegistry {
+    function registerReturnValue(bytes32 callKey, bytes calldata data) external;
+    function getReturnValue(bytes32 callKey) external returns (bool, bytes memory);
+    function clearReturnValues(bytes32 callKey) external;
+}
+```
 
-### Builder
+### A.2 L1SenderProxyL2Factory
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--l1-rpc` | `http://localhost:8545` | L1 RPC endpoint |
-| `--fullnode` | `http://localhost:9546` | L2 fullnode endpoint |
-| `--rollup` | Required | NativeRollupCore address |
-| `--admin-key` | Required | Private key for signing proofs |
-| `--port` | `3200` | Builder API port |
+```solidity
+interface IL1SenderProxyL2Factory {
+    function deployProxy(address l1Address) external returns (address);
+    function computeProxyAddress(address l1Address) external view returns (address);
+    function proxies(address l1Address) external view returns (address);
+}
+```
 
-### L1 Proxy
+### A.3 L1SenderProxyL2
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--rpc` | `http://localhost:8545` | Underlying L1 RPC |
-| `--builder` | `http://localhost:3200` | Builder API endpoint |
-| `--port` | `8546` | Proxy port |
+```solidity
+interface IL1SenderProxyL2 {
+    function systemAddress() external view returns (address);
+    function l1Address() external view returns (address);
+    function callRegistry() external view returns (address);
+}
+```
+
+---
+
+## Appendix B: Pseudocode for Full Sync
+
+```python
+def sync_from_genesis(l1_rpc, rollup_address, deployment_block):
+    # Initialize L2 EVM
+    l2 = create_l2_evm(chain_id=10200200)
+
+    # Fund system address
+    l2.set_balance(SYSTEM_ADDRESS, 10**28)
+
+    # Deploy system contracts
+    l2.deploy(L2CallRegistry, [SYSTEM_ADDRESS], from=SYSTEM_ADDRESS, nonce=0)
+    l2.deploy(L1SenderProxyL2Factory, [SYSTEM_ADDRESS, REGISTRY_ADDRESS], from=SYSTEM_ADDRESS, nonce=1)
+
+    genesis_root = l2.get_state_root()
+
+    # Verify genesis matches L1
+    l1_genesis = rollup.l2BlockHash(block=deployment_block)
+    assert genesis_root == l1_genesis
+
+    # Fetch and process events
+    events = fetch_events(l1_rpc, rollup_address, from_block=deployment_block)
+    events.sort(key=lambda e: (e.block_number, e.log_index))
+
+    for event in events:
+        if event.type == "L2BlockProcessed":
+            process_l2_block(l2, event)
+        elif event.type == "IncomingCallHandled":
+            process_incoming_call(l2, event)
+
+    return l2.get_state_root()
+```
+
+---
+
+## Changelog
+
+- **v0.1**: Initial draft specification (SPEC.md)
+- **v0.2**: Merged with operational component specifications (SPECIFICATIONS.md)
