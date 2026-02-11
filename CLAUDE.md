@@ -60,15 +60,25 @@ forge verify-contract <ADDRESS> <CONTRACT> --verifier blockscout --verifier-url 
 forge verify-contract <ADDRESS> <CONTRACT> --verifier sourcify --chain-id 100
 ```
 
-## Current Deployment (January 2026)
+## Current Deployment (February 2026)
 
 | Contract | Address | Gnosisscan | Blockscout |
 |----------|---------|------------|------------|
-| NativeRollupCore | `0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d` | [View](https://gnosisscan.io/address/0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d#code) | [View](https://gnosis.blockscout.com/address/0x5E87A156F55c85e765C81af1312C76f8a9a1bc7d) |
-| AdminProofVerifier | `0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C` | [View](https://gnosisscan.io/address/0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C#code) | [View](https://gnosis.blockscout.com/address/0x797dEe9c58b9F685a2B5bfa8dA6AE16875F8Ef8C) |
+| NativeRollupCore | `0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C` | [View](https://gnosisscan.io/address/0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C#code) | [View](https://gnosis.blockscout.com/address/0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C) |
+| AdminProofVerifier | `0xfA817b7BF6DE448818B52709A3939Ae7046B0223` | [View](https://gnosisscan.io/address/0xfA817b7BF6DE448818B52709A3939Ae7046B0223#code) | [View](https://gnosis.blockscout.com/address/0xfA817b7BF6DE448818B52709A3939Ae7046B0223) |
+| TokenBridgeVault (L1) | `0x69c02E7dBD6388d006Da932DF90F3215F54A4368` | [View](https://gnosisscan.io/address/0x69c02E7dBD6388d006Da932DF90F3215F54A4368#code) | [View](https://gnosis.blockscout.com/address/0x69c02E7dBD6388d006Da932DF90F3215F54A4368) |
+| LoggerWithStorage (L1) | `0xd988A3c2465aDc0fc210739988f24E2d29daA7D8` | [View](https://gnosisscan.io/address/0xd988A3c2465aDc0fc210739988f24E2d29daA7D8#code) | [View](https://gnosis.blockscout.com/address/0xd988A3c2465aDc0fc210739988f24E2d29daA7D8) |
+
+**L2 Contracts:**
+| Contract | Address |
+|----------|---------|
+| TokenBridgeL2 | `0xFf03cC4d43ea9d033f7A4c9FB87057e9fbC143Ea` |
+| Counter | `0x8e8f5880BaCF9DCbE786623E5D4724B96D80A56f` |
+| Counter L2SenderProxy (L1) | `0x226e4ef684612F65C7849e3866df5a745470064A` |
 
 **Deployment Details:**
-- Genesis Hash: `0x0000000000000000000000000000000000000000000000000000000000000000` (matches Anvil block 0)
+- Deployment Block: `44613529`
+- Genesis Hash: `0x30909382f429ea0dbe44c276c1cd2b7bd1d23a21ed301a9a61833c3e814f1bb3`
 - Compiler: solc 0.8.27
 - EVM Version: cancun
 

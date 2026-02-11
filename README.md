@@ -326,16 +326,43 @@ The builder ensures this by:
 
 ## Current Deployment
 
-**Gnosis Mainnet (January 2026):**
+**Gnosis Mainnet (February 2026):**
 
-| Contract | Address | Blockscout |
-|----------|---------|------------|
-| NativeRollupCore | `0x7c7aBBd57007E86323F28744808C51385e8010E4` | [View](https://gnosis.blockscout.com/address/0x7c7aBBd57007E86323F28744808C51385e8010E4) |
-| AdminProofVerifier | `0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50` | [View](https://gnosis.blockscout.com/address/0xe0Cc4B78051aE9D39227895c3CC3CCA4C6649b50) |
+### Core Contracts
+
+| Contract | Address | Explorer |
+|----------|---------|----------|
+| NativeRollupCore | `0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C` | [Gnosisscan](https://gnosisscan.io/address/0x2F685bc8f4C4c5faBEe6817a9764Edee7B1bc26C) |
+| AdminProofVerifier | `0xfA817b7BF6DE448818B52709A3939Ae7046B0223` | [Gnosisscan](https://gnosisscan.io/address/0xfA817b7BF6DE448818B52709A3939Ae7046B0223) |
+
+### Bridge Contracts
+
+| Contract | Address | Layer |
+|----------|---------|-------|
+| TokenBridgeVault | `0x69c02E7dBD6388d006Da932DF90F3215F54A4368` | L1 |
+| TokenBridgeL2 | `0xFf03cC4d43ea9d033f7A4c9FB87057e9fbC143Ea` | L2 |
+| L2SenderProxy (Bridge) | `0x007Cf8A73fccD751f27c02D6eA5917f1AAa5c7BD` | L1 |
+| L1SenderProxyL2 (Vault) | `0x68c6f743461e8ac7b7848388B79c46b07535ec57` | L2 |
+| BridgedUSDC | `0x84E91d42ac8fcF49Bc777BC9ea15F82dDC60bB1a` | L2 |
+
+### L2 System Contracts
+
+| Contract | Address |
+|----------|---------|
+| L2CallRegistry | `0xF2E246BB76DF876Cef8b38ae84130F4F55De395b` |
+| L1SenderProxyL2Factory | `0x2946259E0334f33A064106302415aD3391BeD384` |
+
+### Example Contracts
+
+| Contract | Address | Layer | Description |
+|----------|---------|-------|-------------|
+| Counter | `0x8e8f5880BaCF9DCbE786623E5D4724B96D80A56f` | L2 | Simple counter, increments on each call |
+| Counter L2SenderProxy | `0x226e4ef684612F65C7849e3866df5a745470064A` | L1 | Proxy for calling Counter from L1 |
+| LoggerWithStorage | `0xd988A3c2465aDc0fc210739988f24E2d29daA7D8` | L1 | Logs L1→L2 calls with return values |
 
 **Deployment Details:**
-- Deployment Block: `44428519`
-- Genesis State Root: `0x473cf0cc2c7fd6e37abf75db24443096e184b9790b87d7515114729cffe2a964`
+- Deployment Block: `44613529`
+- Genesis State Root: `0x30909382f429ea0dbe44c276c1cd2b7bd1d23a21ed301a9a61833c3e814f1bb3`
 - Admin/Owner: `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1`
 - L2 Chain ID: `10200200`
 - Compiler: solc 0.8.27, EVM: cancun
