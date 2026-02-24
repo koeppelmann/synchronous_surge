@@ -6,10 +6,6 @@ Project-specific instructions for Claude Code.
 
 Etherscan has migrated to API V2. Forge's built-in verification does not yet support V2, so use curl directly.
 
-### API Key
-```
-3ARSB3HVTB4W5MW463BDJU35J4H94FTJRR
-```
 
 ### Step 1: Generate Standard JSON Input
 ```bash
@@ -86,4 +82,4 @@ forge verify-contract <ADDRESS> <CONTRACT> --verifier sourcify --chain-id 100
 
 | Role | Address | Private Key |
 |------|---------|-------------|
-| Admin/Owner | `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1` | `0xf2024347d89be67338b62344010fb2ebc5db60cad2ff591a92a30b8215f87f22` |
+| Admin/Owner | `0xE5e69c567516C6C3E88ABEb2455d1228d2aF35F1` | 
