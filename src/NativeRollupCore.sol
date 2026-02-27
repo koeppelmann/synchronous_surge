@@ -49,7 +49,8 @@ contract NativeRollupCore {
     bool private _locked;
 
     /// @notice Salt used for CREATE2 proxy deployment
-    bytes32 public constant PROXY_SALT = keccak256("NativeRollup.L2SenderProxy.v1");
+    bytes32 public constant PROXY_SALT =
+        keccak256("NativeRollup.L2SenderProxy.v1");
 
     /// @notice Registered incoming call responses
     /// @dev Key: keccak256(l2Address, l2StateHash, callDataHash)
@@ -58,14 +59,26 @@ contract NativeRollupCore {
     /// @notice Whether an incoming call response is registered
     mapping(bytes32 => bool) public incomingCallRegistered;
 
+    /// @notice Block number when each incoming call response was registered
+    /// @dev Used for stale cleanup. This pattern applies to both L1→L2 buffered
+    ///      responses (this contract) and L2→L1 buffered executions (sync-rollups).
+    ///      In both architectures, pre-computed state transitions persist indefinitely
+    ///      after the state advances past them. Tracking registration time enables
+    ///      permissionless garbage collection.
+    mapping(bytes32 => uint256) public incomingCallRegisteredBlock;
+
+    /// @notice Maximum age (in blocks) before a response becomes eligible for cleanup
+    /// @dev ~51 minutes at 12s/slot, aligned with BLOCKHASH opcode window
+    uint256 public constant MAX_RESPONSE_AGE = 256;
+
     /// @notice Incoming call response structure
     /// @dev Contains the pre-computed response for an L1→L2 call
     struct IncomingCallResponse {
-        bytes32 preOutgoingCallsStateHash;  // L2 state before outgoing calls
-        OutgoingCall[] outgoingCalls;        // Outgoing L1 calls with per-call state hashes
-        bytes[] expectedResults;             // Expected results for each outgoing call
-        bytes returnValue;                   // Value to return to caller
-        bytes32 finalStateHash;              // Final L2 state after all calls complete
+        bytes32 preOutgoingCallsStateHash; // L2 state before outgoing calls
+        OutgoingCall[] outgoingCalls; // Outgoing L1 calls with per-call state hashes
+        bytes[] expectedResults; // Expected results for each outgoing call
+        bytes returnValue; // Value to return to caller
+        bytes32 finalStateHash; // Final L2 state after all calls complete
     }
 
     /// @notice Emitted when L2 state transitions
@@ -74,16 +87,16 @@ contract NativeRollupCore {
         uint256 indexed blockNumber,
         bytes32 indexed prevBlockHash,
         bytes32 indexed newBlockHash,
-        bytes rlpEncodedTx,              // The RLP-encoded signed L2 transaction
-        OutgoingCall[] outgoingCalls,    // L2→L1 calls made during execution
-        bytes[] outgoingCallResults      // Results returned by L1 calls
+        bytes rlpEncodedTx, // The RLP-encoded signed L2 transaction
+        OutgoingCall[] outgoingCalls, // L2→L1 calls made during execution
+        bytes[] outgoingCallResults // Results returned by L1 calls
     );
 
     /// @notice Emitted when L2 state is updated (includes intermediate states)
     event L2StateUpdated(
         uint256 indexed blockNumber,
         bytes32 indexed newStateHash,
-        uint256 callIndex  // 0 = post-execution, 1+ = after outgoing call
+        uint256 callIndex // 0 = post-execution, 1+ = after outgoing call
     );
 
     /// @notice Emitted when an outgoing L1 call is executed
@@ -96,10 +109,16 @@ contract NativeRollupCore {
     );
 
     /// @notice Emitted when a new L2SenderProxy is deployed
-    event L2SenderProxyDeployed(address indexed l2Address, address indexed proxyAddress);
+    event L2SenderProxyDeployed(
+        address indexed l2Address,
+        address indexed proxyAddress
+    );
 
     /// @notice Emitted when proof verifier is upgraded
-    event ProofVerifierUpgraded(address indexed oldVerifier, address indexed newVerifier);
+    event ProofVerifierUpgraded(
+        address indexed oldVerifier,
+        address indexed newVerifier
+    );
 
     /// @notice Emitted when an incoming call response is registered
     event IncomingCallRegistered(
@@ -109,17 +128,20 @@ contract NativeRollupCore {
         bytes32 responseKey
     );
 
+    /// @notice Emitted when a stale incoming call response is cleaned up
+    event StaleIncomingCallCleaned(bytes32 indexed responseKey);
+
     /// @notice Emitted when an incoming call is handled (L1→L2 call)
     /// @dev Contains ALL data needed for fullnode to reconstruct L2 state
     event IncomingCallHandled(
         address indexed l2Address,
         address indexed l1Caller,
         bytes32 indexed prevBlockHash,
-        bytes callData,                  // The calldata that was sent to the L2 contract
-        uint256 value,                   // ETH value sent
-        OutgoingCall[] outgoingCalls,    // L2→L1 calls made during execution
-        bytes[] outgoingCallResults,     // Results returned by L1 calls
-        bytes32 finalStateHash           // Final L2 state after all calls
+        bytes callData, // The calldata that was sent to the L2 contract
+        uint256 value, // ETH value sent
+        OutgoingCall[] outgoingCalls, // L2→L1 calls made during execution
+        bytes[] outgoingCallResults, // Results returned by L1 calls
+        bytes32 finalStateHash // Final L2 state after all calls
     );
 
     error InvalidPrevBlockHash(bytes32 expected, bytes32 provided);
@@ -127,7 +149,11 @@ contract NativeRollupCore {
     error Reentrancy();
     error OutgoingCallFailed(uint256 index, address from, address target);
     error UnexpectedCallResult(uint256 index, bytes32 expected, bytes32 actual);
-    error UnexpectedPostCallState(uint256 index, bytes32 expected, bytes32 actual);
+    error UnexpectedPostCallState(
+        uint256 index,
+        bytes32 expected,
+        bytes32 actual
+    );
     error OnlyOwner();
     error IncomingCallNotRegistered(bytes32 responseKey);
     error IncomingCallAlreadyRegistered(bytes32 responseKey);
@@ -135,6 +161,7 @@ contract NativeRollupCore {
     error UnexpectedPreOutgoingState(bytes32 expected, bytes32 actual);
     error UnexpectedFinalState(bytes32 expected, bytes32 actual);
     error OnlyProxy();
+    error NotStale();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -183,15 +210,17 @@ contract NativeRollupCore {
         }
 
         // Verify the proof covers the entire state transition chain
-        if (!proofVerifier.verifyProof(
-            prevL2BlockHash,
-            rlpEncodedTx,
-            preOutgoingCallsStateHash,
-            outgoingCalls,
-            expectedResults,
-            finalStateHash,
-            proof
-        )) {
+        if (
+            !proofVerifier.verifyProof(
+                prevL2BlockHash,
+                rlpEncodedTx,
+                preOutgoingCallsStateHash,
+                outgoingCalls,
+                expectedResults,
+                finalStateHash,
+                proof
+            )
+        ) {
             revert ProofVerificationFailed();
         }
 
@@ -215,12 +244,16 @@ contract NativeRollupCore {
             address proxy = _getOrDeployProxy(c.from);
 
             // Execute call through proxy with specified gas limit
-            (bool success, bytes memory result) = L2SenderProxy(payable(proxy)).execute{value: c.value, gas: c.gas}(
-                c.target,
-                c.data
-            );
+            (bool success, bytes memory result) = L2SenderProxy(payable(proxy))
+                .execute{value: c.value, gas: c.gas}(c.target, c.data);
 
-            emit OutgoingCallExecuted(l2BlockNumber, i, c.from, c.target, success);
+            emit OutgoingCallExecuted(
+                l2BlockNumber,
+                i,
+                c.from,
+                c.target,
+                success
+            );
 
             if (!success) {
                 revert OutgoingCallFailed(i, c.from, c.target);
@@ -233,7 +266,11 @@ contract NativeRollupCore {
             bytes32 actualResultHash = keccak256(result);
             bytes32 expectedResultHash = keccak256(expectedResults[i]);
             if (actualResultHash != expectedResultHash) {
-                revert UnexpectedCallResult(i, expectedResultHash, actualResultHash);
+                revert UnexpectedCallResult(
+                    i,
+                    expectedResultHash,
+                    actualResultHash
+                );
             }
 
             // Verify the post-call L2 state matches expectation
@@ -241,7 +278,11 @@ contract NativeRollupCore {
             // If no side effect occurred, l2BlockHash should still equal the pre-call state
             // Either way, it must match the expected postCallStateHash
             if (l2BlockHash != c.postCallStateHash) {
-                revert UnexpectedPostCallState(i, c.postCallStateHash, l2BlockHash);
+                revert UnexpectedPostCallState(
+                    i,
+                    c.postCallStateHash,
+                    l2BlockHash
+                );
             }
 
             emit L2StateUpdated(l2BlockNumber, l2BlockHash, i + 1);
@@ -256,7 +297,14 @@ contract NativeRollupCore {
         }
 
         // Emit the final block processed event with all data for fullnode reconstruction
-        emit L2BlockProcessed(l2BlockNumber, prevHash, l2BlockHash, rlpEncodedTx, outgoingCalls, actualResults);
+        emit L2BlockProcessed(
+            l2BlockNumber,
+            prevHash,
+            l2BlockHash,
+            rlpEncodedTx,
+            outgoingCalls,
+            actualResults
+        );
     }
 
     /// @notice Register an incoming call response
@@ -280,12 +328,22 @@ contract NativeRollupCore {
         }
 
         // Verify the proof (admin signature for POC)
-        if (!_verifyIncomingCallProof(l2Address, stateHash, callData, response, proof)) {
+        if (
+            !_verifyIncomingCallProof(
+                l2Address,
+                stateHash,
+                callData,
+                response,
+                proof
+            )
+        ) {
             revert IncomingCallProofFailed();
         }
 
         // Store the response
-        IncomingCallResponse storage stored = incomingCallResponses[responseKey];
+        IncomingCallResponse storage stored = incomingCallResponses[
+            responseKey
+        ];
         stored.preOutgoingCallsStateHash = response.preOutgoingCallsStateHash;
         stored.returnValue = response.returnValue;
         stored.finalStateHash = response.finalStateHash;
@@ -297,8 +355,14 @@ contract NativeRollupCore {
         }
 
         incomingCallRegistered[responseKey] = true;
+        incomingCallRegisteredBlock[responseKey] = block.number;
 
-        emit IncomingCallRegistered(l2Address, stateHash, keccak256(callData), responseKey);
+        emit IncomingCallRegistered(
+            l2Address,
+            stateHash,
+            keccak256(callData),
+            responseKey
+        );
     }
 
     /// @notice Handle an incoming call to an L2 address
@@ -326,18 +390,25 @@ contract NativeRollupCore {
             revert IncomingCallNotRegistered(responseKey);
         }
 
-        IncomingCallResponse storage response = incomingCallResponses[responseKey];
+        IncomingCallResponse storage response = incomingCallResponses[
+            responseKey
+        ];
 
         // Update state to pre-outgoing-calls state
         l2BlockHash = response.preOutgoingCallsStateHash;
 
         // Verify the state was updated correctly
         if (l2BlockHash != response.preOutgoingCallsStateHash) {
-            revert UnexpectedPreOutgoingState(response.preOutgoingCallsStateHash, l2BlockHash);
+            revert UnexpectedPreOutgoingState(
+                response.preOutgoingCallsStateHash,
+                l2BlockHash
+            );
         }
 
         // Collect actual results from outgoing calls
-        bytes[] memory actualResults = new bytes[](response.outgoingCalls.length);
+        bytes[] memory actualResults = new bytes[](
+            response.outgoingCalls.length
+        );
 
         // Execute outgoing calls (these may recursively call back)
         for (uint256 i = 0; i < response.outgoingCalls.length; i++) {
@@ -347,12 +418,16 @@ contract NativeRollupCore {
             address proxy = _getOrDeployProxy(c.from);
 
             // Execute call through proxy with specified gas limit
-            (bool success, bytes memory result) = L2SenderProxy(payable(proxy)).execute{value: c.value, gas: c.gas}(
-                c.target,
-                c.data
-            );
+            (bool success, bytes memory result) = L2SenderProxy(payable(proxy))
+                .execute{value: c.value, gas: c.gas}(c.target, c.data);
 
-            emit OutgoingCallExecuted(l2BlockNumber, i, c.from, c.target, success);
+            emit OutgoingCallExecuted(
+                l2BlockNumber,
+                i,
+                c.from,
+                c.target,
+                success
+            );
 
             if (!success) {
                 revert OutgoingCallFailed(i, c.from, c.target);
@@ -365,12 +440,20 @@ contract NativeRollupCore {
             bytes32 actualResultHash = keccak256(result);
             bytes32 expectedResultHash = keccak256(response.expectedResults[i]);
             if (actualResultHash != expectedResultHash) {
-                revert UnexpectedCallResult(i, expectedResultHash, actualResultHash);
+                revert UnexpectedCallResult(
+                    i,
+                    expectedResultHash,
+                    actualResultHash
+                );
             }
 
             // Verify the post-call L2 state matches expectation
             if (l2BlockHash != c.postCallStateHash) {
-                revert UnexpectedPostCallState(i, c.postCallStateHash, l2BlockHash);
+                revert UnexpectedPostCallState(
+                    i,
+                    c.postCallStateHash,
+                    l2BlockHash
+                );
             }
         }
 
@@ -428,21 +511,22 @@ contract NativeRollupCore {
         bytes calldata proof
     ) internal view returns (bool) {
         // Hash the response data
-        bytes32 messageHash = keccak256(abi.encode(
-            l2Address,
-            stateHash,
-            keccak256(callData),
-            response.preOutgoingCallsStateHash,
-            _hashOutgoingCalls(response.outgoingCalls),
-            _hashResults(response.expectedResults),
-            keccak256(response.returnValue),
-            response.finalStateHash
-        ));
+        bytes32 messageHash = keccak256(
+            abi.encode(
+                l2Address,
+                stateHash,
+                keccak256(callData),
+                response.preOutgoingCallsStateHash,
+                _hashOutgoingCalls(response.outgoingCalls),
+                _hashResults(response.expectedResults),
+                keccak256(response.returnValue),
+                response.finalStateHash
+            )
+        );
 
-        bytes32 ethSignedMessageHash = keccak256(abi.encodePacked(
-            "\x19Ethereum Signed Message:\n32",
-            messageHash
-        ));
+        bytes32 ethSignedMessageHash = keccak256(
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash)
+        );
 
         address signer = _recoverSigner(ethSignedMessageHash, proof);
 
@@ -452,7 +536,9 @@ contract NativeRollupCore {
     }
 
     /// @notice Hash outgoing calls for proof verification
-    function _hashOutgoingCalls(OutgoingCall[] calldata calls) internal pure returns (bytes32) {
+    function _hashOutgoingCalls(
+        OutgoingCall[] calldata calls
+    ) internal pure returns (bytes32) {
         bytes memory encoded;
         for (uint256 i = 0; i < calls.length; i++) {
             encoded = abi.encodePacked(
@@ -469,7 +555,9 @@ contract NativeRollupCore {
     }
 
     /// @notice Hash expected results for proof verification
-    function _hashResults(bytes[] calldata results) internal pure returns (bytes32) {
+    function _hashResults(
+        bytes[] calldata results
+    ) internal pure returns (bytes32) {
         bytes memory encoded;
         for (uint256 i = 0; i < results.length; i++) {
             encoded = abi.encodePacked(encoded, keccak256(results[i]));
@@ -478,7 +566,10 @@ contract NativeRollupCore {
     }
 
     /// @notice Recover signer from signature
-    function _recoverSigner(bytes32 hash, bytes calldata signature) internal pure returns (address) {
+    function _recoverSigner(
+        bytes32 hash,
+        bytes calldata signature
+    ) internal pure returns (address) {
         if (signature.length != 65) return address(0);
 
         bytes32 r;
@@ -500,17 +591,28 @@ contract NativeRollupCore {
     /// @param l2Address The L2 contract address
     /// @return The L1 proxy address that will be msg.sender for calls from this L2 address
     function getProxyAddress(address l2Address) public view returns (address) {
-        bytes32 bytecodeHash = keccak256(abi.encodePacked(
-            type(L2SenderProxy).creationCode,
-            abi.encode(address(this), l2Address)
-        ));
+        bytes32 bytecodeHash = keccak256(
+            abi.encodePacked(
+                type(L2SenderProxy).creationCode,
+                abi.encode(address(this), l2Address)
+            )
+        );
 
-        return address(uint160(uint256(keccak256(abi.encodePacked(
-            bytes1(0xff),
-            address(this),
-            keccak256(abi.encode(PROXY_SALT, l2Address)),
-            bytecodeHash
-        )))));
+        return
+            address(
+                uint160(
+                    uint256(
+                        keccak256(
+                            abi.encodePacked(
+                                bytes1(0xff),
+                                address(this),
+                                keccak256(abi.encode(PROXY_SALT, l2Address)),
+                                bytecodeHash
+                            )
+                        )
+                    )
+                )
+            );
     }
 
     /// @notice Check if a proxy is deployed for an L2 address
@@ -539,7 +641,9 @@ contract NativeRollupCore {
     /// @notice Get or deploy a proxy for an L2 address
     /// @param l2Address The L2 contract address
     /// @return proxy The proxy address
-    function _getOrDeployProxy(address l2Address) internal returns (address proxy) {
+    function _getOrDeployProxy(
+        address l2Address
+    ) internal returns (address proxy) {
         proxy = getProxyAddress(l2Address);
 
         uint256 size;
@@ -563,6 +667,51 @@ contract NativeRollupCore {
             require(proxy != address(0), "Proxy deployment failed");
             emit L2SenderProxyDeployed(l2Address, proxy);
         }
+    }
+
+    /// @notice Removes an expired incoming call response (TTL-based garbage collection)
+    /// @dev Permissionless — anyone can call to reclaim storage gas refunds.
+    ///      This implements TTL (time-to-live) semantics: responses expire after
+    ///      maxAge blocks and must be re-registered if still needed. This is an
+    ///      intentional design constraint — the response window is bounded.
+    ///
+    ///      This pattern is direction-agnostic: it applies identically to
+    ///      L2→L1 execution buffers (sync-rollups/Rollups.sol loadL2Executions) and
+    ///      L1→L2 response buffers (this contract's registerIncomingCall).
+    ///      In both cases, pre-computed state transitions should be consumed promptly
+    ///      or re-submitted; unbounded storage accumulation is unacceptable.
+    /// @param responseKey The key of the response to clean up
+    /// @param maxAge Maximum age in blocks. Pass 0 for default MAX_RESPONSE_AGE.
+    function cleanupStaleIncomingCall(
+        bytes32 responseKey,
+        uint256 maxAge
+    ) external {
+        if (maxAge == 0) {
+            maxAge = MAX_RESPONSE_AGE;
+        }
+
+        // Must be registered
+        if (!incomingCallRegistered[responseKey]) {
+            revert NotStale();
+        }
+
+        // Must be old enough
+        uint256 registeredAt = incomingCallRegisteredBlock[responseKey];
+        if (registeredAt == 0 || block.number <= registeredAt + maxAge) {
+            revert NotStale();
+        }
+
+        // TTL expiry: the response was registered against a specific stateHash
+        // and has exceeded its validity window without being consumed.
+        // If still needed, the submitter must re-register with a fresh proof.
+        // The age check + unconsumed status is sufficient for TTL-based cleanup.
+
+        // Clean up all storage
+        delete incomingCallResponses[responseKey];
+        delete incomingCallRegistered[responseKey];
+        delete incomingCallRegisteredBlock[responseKey];
+
+        emit StaleIncomingCallCleaned(responseKey);
     }
 
     /// @notice Upgrade the proof verifier
